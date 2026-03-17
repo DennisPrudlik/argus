@@ -189,13 +189,20 @@ What is not yet implemented:
 
 ## Next Implementation Step
 
-The most valuable next step is to add **macOS network connection monitoring** so feature coverage is closer to the Linux backend.
+The immediate focus is the **Linux backend first**.
 
 Recommended direction:
 
-- add a separate macOS network-monitoring backend using the Network Extension framework
-- map connection metadata into the existing `EVENT_CONNECT` fields from `argus.h`
-- keep the current shared filtering and output pipeline in `output.c`
-- preserve the existing CLI so `--json`, `--pid`, and `--comm` work consistently across platforms
+- harden the Linux tracer with validation on real workloads and edge cases
+- expand Linux event coverage before chasing platform parity
+- keep the shared event model in `argus.h` stable while the Linux feature set matures
+- continue using the shared filtering and output pipeline in `output.c`
 
-This closes the biggest current platform gap and makes Argus more uniformly useful on both Linux and macOS.
+## Linux-First Roadmap
+
+- **Step 1**: Strengthen the Linux `eBPF` path with test coverage and sample validation for `EXEC`, `OPEN`, `EXIT`, and `CONNECT`
+- **Step 2**: Add more Linux activity types such as `accept`, `bind`, `listen`, `rename`, or `unlink` where they fit the current event model
+- **Step 3**: Improve Linux usability with packaging, clearer dependency checks, and better setup guidance for `libbpf` / `bpftool`
+- **Step 4**: After the Linux backend is stable, bring macOS closer to parity with a separate network-monitoring implementation
+
+This keeps Argus focused on building a strong Linux tracer first, then using that baseline to guide parity work on macOS.
