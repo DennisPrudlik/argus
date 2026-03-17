@@ -1,11 +1,13 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <signal.h>
 #include <errno.h>
-#include <arpa/inet.h>
+#include <getopt.h>
 #include <bpf/libbpf.h>
 #include "argus.skel.h"
 #include "argus.h"
+#include "output.h"
 
 static volatile int running = 1;
 
@@ -15,63 +17,58 @@ static void sig_handler(int sig)
     running = 0;
 }
 
-static void print_header(void)
+static void usage(const char *prog)
 {
-    printf("Tracing (EXEC, OPEN, EXIT, CONNECT)... Hit Ctrl-C to stop.\n\n");
-    printf("%-5s  %-6s  %-6s  %-4s  %-4s  %-16s  %s\n",
-           "TYPE", "PID", "PPID", "UID", "GID", "COMM", "DETAIL");
-    printf("%-5s  %-6s  %-6s  %-4s  %-4s  %-16s  %s\n",
-           "-----", "------", "------", "----", "----",
-           "----------------", "------");
-}
-
-static void print_event(const event_t *e)
-{
-    /* common prefix */
-    printf("%-5s  %-6d  %-6d  %-4u  %-4u  %-16s  ",
-           e->type == EVENT_EXEC    ? "EXEC"  :
-           e->type == EVENT_OPEN    ? "OPEN"  :
-           e->type == EVENT_EXIT    ? "EXIT"  :
-           e->type == EVENT_CONNECT ? "CONN"  : "?",
-           e->pid, e->ppid, e->uid, e->gid, e->comm);
-
-    switch (e->type) {
-    case EVENT_EXEC:
-        printf("%s %s", e->filename, e->args);
-        break;
-    case EVENT_OPEN:
-        printf("[%s] %s",
-               e->success ? "OK" : "FAIL",
-               e->filename);
-        break;
-    case EVENT_EXIT:
-        printf("exit_code=%d", e->exit_code);
-        break;
-    case EVENT_CONNECT: {
-        char addr[INET6_ADDRSTRLEN] = {};
-        if (e->family == AF_INET)
-            inet_ntop(AF_INET,  e->daddr, addr, sizeof(addr));
-        else
-            inet_ntop(AF_INET6, e->daddr, addr, sizeof(addr));
-        printf("[%s] %s:%u",
-               e->success ? "OK" : "FAIL",
-               addr, e->dport);
-        break;
-    }
-    }
-    putchar('\n');
+    fprintf(stderr,
+        "Usage: %s [OPTIONS]\n"
+        "\n"
+        "Options:\n"
+        "  --pid  <pid>   Only show events from this PID\n"
+        "  --comm <name>  Only show events from processes matching this name\n"
+        "  --path <str>   Only show file events whose path contains this string\n"
+        "  --json         Emit newline-delimited JSON instead of text\n"
+        "  --help         Show this message\n",
+        prog);
 }
 
 static int handle_event(void *ctx, void *data, size_t data_sz)
 {
     (void)ctx;
     (void)data_sz;
-    print_event((const event_t *)data);
+    const event_t *e = data;
+    if (event_matches(e))
+        print_event(e);
     return 0;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    filter_t      filter  = {0};
+    output_fmt_t  fmt     = OUTPUT_TEXT;
+
+    static const struct option long_opts[] = {
+        {"pid",  required_argument, 0, 'p'},
+        {"comm", required_argument, 0, 'c'},
+        {"path", required_argument, 0, 'P'},
+        {"json", no_argument,       0, 'j'},
+        {"help", no_argument,       0, 'h'},
+        {0, 0, 0, 0}
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "p:c:P:jh", long_opts, NULL)) != -1) {
+        switch (opt) {
+        case 'p': filter.pid = atoi(optarg);                                break;
+        case 'c': strncpy(filter.comm, optarg, sizeof(filter.comm) - 1);   break;
+        case 'P': strncpy(filter.path, optarg, sizeof(filter.path) - 1);   break;
+        case 'j': fmt = OUTPUT_JSON;                                        break;
+        case 'h': usage(argv[0]); return 0;
+        default:  usage(argv[0]); return 1;
+        }
+    }
+
+    output_init(fmt, &filter);
+
     struct argus_bpf *skel = NULL;
     struct ring_buffer *rb = NULL;
     int err;
@@ -100,14 +97,11 @@ int main(void)
         goto cleanup;
     }
 
-    print_header();
+    print_header("eBPF");
 
     while (running) {
-        err = ring_buffer__poll(rb, 100 /* ms timeout */);
-        if (err == -EINTR) {
-            err = 0;
-            break;
-        }
+        err = ring_buffer__poll(rb, 100);
+        if (err == -EINTR) { err = 0; break; }
         if (err < 0) {
             fprintf(stderr, "error: ring buffer poll failed: %d\n", err);
             break;

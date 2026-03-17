@@ -12,8 +12,8 @@ CFLAGS := -g -Wall -I.
 
 all: argus_esf
 
-argus_esf: argus_esf.c argus.h
-	$(CLANG) $(CFLAGS) -o $@ argus_esf.c \
+argus_esf: argus_esf.c output.c output.h argus.h
+	$(CLANG) $(CFLAGS) -o $@ argus_esf.c output.c \
 		-framework EndpointSecurity -lbsm
 	@echo ""
 	@echo "NOTE: sign the binary before running:"
@@ -47,8 +47,8 @@ argus.skel.h: argus.bpf.o
 	$(BPFTOOL) gen skeleton $< > $@
 
 # 4. Compile the userspace loader
-argus: argus.c argus.skel.h argus.h
-	$(CC) $(CFLAGS) -o $@ argus.c -lbpf -lelf -lz
+argus: argus.c output.c output.h argus.skel.h argus.h
+	$(CC) $(CFLAGS) -o $@ argus.c output.c -lbpf -lelf -lz
 
 clean:
 	rm -f argus argus.bpf.o argus.skel.h vmlinux.h

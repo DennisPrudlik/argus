@@ -15,8 +15,11 @@
  *   - Must run as root
  *
  * Build:
- *   clang -g -Wall -o argus_esf argus_esf.c \
+ *   clang -g -Wall -o argus_esf argus_esf.c output.c \
  *         -framework EndpointSecurity -lbsm
+ *
+ * Code-sign (after obtaining entitlement from Apple):
+ *   codesign --entitlements argus.entitlements -s "Developer ID" argus_esf
  *
  * NOTE: duration_ns is always 0 for all events — NOTIFY_* fires after the
  * fact. AUTH_* variants allow timing but require responding allow/deny.
@@ -26,17 +29,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
-#include <arpa/inet.h>
+#include <getopt.h>
 #include <sys/wait.h>
 #include <bsm/libbsm.h>
 #include <EndpointSecurity/EndpointSecurity.h>
 #include <dispatch/dispatch.h>
 #include "argus.h"
+#include "output.h"
 
 /* ── helpers ────────────────────────────────────────────────────────────── */
 
 static void fill_common(event_t *e, const es_process_t *proc,
-                         event_type_t type)
+                        event_type_t type)
 {
     e->type        = type;
     e->pid         = audit_token_to_pid(proc->audit_token);
@@ -79,7 +83,8 @@ static void handle_exec(const es_message_t *msg)
             e.args[off++] = ' ';
     }
 
-    print_event(&e);
+    if (event_matches(&e))
+        print_event(&e);
 }
 
 static void handle_open(const es_message_t *msg)
@@ -90,7 +95,8 @@ static void handle_open(const es_message_t *msg)
     strncpy(e.filename, msg->event.open.file->path.data,
             sizeof(e.filename) - 1);
 
-    print_event(&e);
+    if (event_matches(&e))
+        print_event(&e);
 }
 
 static void handle_exit(const es_message_t *msg)
@@ -102,50 +108,58 @@ static void handle_exit(const es_message_t *msg)
     if (WIFEXITED(stat))
         e.exit_code = WEXITSTATUS(stat);
     else if (WIFSIGNALED(stat))
-        e.exit_code = -WTERMSIG(stat); /* negative = killed by signal */
+        e.exit_code = -WTERMSIG(stat);
 
-    print_event(&e);
+    if (event_matches(&e))
+        print_event(&e);
 }
 
-/* ── printer ────────────────────────────────────────────────────────────── */
+/* ── CLI ────────────────────────────────────────────────────────────────── */
 
-void print_event(const event_t *e)
+static void usage(const char *prog)
 {
-    /* common prefix */
-    printf("%-5s  %-6d  %-6d  %-4u  %-4u  %-16s  ",
-           e->type == EVENT_EXEC    ? "EXEC"    :
-           e->type == EVENT_OPEN    ? "OPEN"    :
-           e->type == EVENT_EXIT    ? "EXIT"    :
-           e->type == EVENT_CONNECT ? "CONN"    : "?",
-           e->pid, e->ppid, e->uid, e->gid, e->comm);
-
-    switch (e->type) {
-    case EVENT_EXEC:
-        printf("%s %s", e->filename, e->args);
-        break;
-    case EVENT_OPEN:
-        printf("%s", e->filename);
-        break;
-    case EVENT_EXIT:
-        printf("exit_code=%d", e->exit_code);
-        break;
-    case EVENT_CONNECT: {
-        char addr[INET6_ADDRSTRLEN] = {};
-        if (e->family == AF_INET)
-            inet_ntop(AF_INET,  e->daddr, addr, sizeof(addr));
-        else
-            inet_ntop(AF_INET6, e->daddr, addr, sizeof(addr));
-        printf("%s:%u", addr, e->dport);
-        break;
-    }
-    }
-    putchar('\n');
+    fprintf(stderr,
+        "Usage: %s [OPTIONS]\n"
+        "\n"
+        "Options:\n"
+        "  --pid  <pid>   Only show events from this PID\n"
+        "  --comm <name>  Only show events from processes matching this name\n"
+        "  --path <str>   Only show file events whose path contains this string\n"
+        "  --json         Emit newline-delimited JSON instead of text\n"
+        "  --help         Show this message\n",
+        prog);
 }
 
 /* ── main ───────────────────────────────────────────────────────────────── */
 
-int main(void)
+int main(int argc, char **argv)
 {
+    filter_t     filter = {0};
+    output_fmt_t fmt    = OUTPUT_TEXT;
+
+    static const struct option long_opts[] = {
+        {"pid",  required_argument, 0, 'p'},
+        {"comm", required_argument, 0, 'c'},
+        {"path", required_argument, 0, 'P'},
+        {"json", no_argument,       0, 'j'},
+        {"help", no_argument,       0, 'h'},
+        {0, 0, 0, 0}
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "p:c:P:jh", long_opts, NULL)) != -1) {
+        switch (opt) {
+        case 'p': filter.pid = atoi(optarg);                               break;
+        case 'c': strncpy(filter.comm, optarg, sizeof(filter.comm) - 1);  break;
+        case 'P': strncpy(filter.path, optarg, sizeof(filter.path) - 1);  break;
+        case 'j': fmt = OUTPUT_JSON;                                       break;
+        case 'h': usage(argv[0]); return 0;
+        default:  usage(argv[0]); return 1;
+        }
+    }
+
+    output_init(fmt, &filter);
+
     es_client_t *client = NULL;
 
     es_new_client_result_t res = es_new_client(&client,
@@ -207,14 +221,7 @@ int main(void)
     dispatch_source_set_event_handler(src_term, shutdown);
     dispatch_resume(src_term);
 
-    printf("Tracing via ESF (EXEC, OPEN, EXIT)... Ctrl-C to stop.\n\n");
-    printf("  NOTE: CONNECT not available via ESF — use Network Extension for network telemetry.\n\n");
-    printf("%-5s  %-6s  %-6s  %-4s  %-4s  %-16s  %s\n",
-           "TYPE", "PID", "PPID", "UID", "GID", "COMM", "DETAIL");
-    printf("%-5s  %-6s  %-6s  %-4s  %-4s  %-16s  %s\n",
-           "-----", "------", "------", "----", "----",
-           "----------------", "------");
-
+    print_header("ESF");
     dispatch_main();
     return 0;
 }

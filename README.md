@@ -186,3 +186,16 @@ What is not yet implemented:
 - packaging/install workflow
 - persisted logging or remote export
 - tests and benchmark coverage
+
+## Next Implementation Step
+
+The most valuable next step is to add **macOS network connection monitoring** so feature coverage is closer to the Linux backend.
+
+Recommended direction:
+
+- add a separate macOS network-monitoring backend using the Network Extension framework
+- map connection metadata into the existing `EVENT_CONNECT` fields from `argus.h`
+- keep the current shared filtering and output pipeline in `output.c`
+- preserve the existing CLI so `--json`, `--pid`, and `--comm` work consistently across platforms
+
+This closes the biggest current platform gap and makes Argus more uniformly useful on both Linux and macOS.
