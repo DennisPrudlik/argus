@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <signal.h>
 #include <errno.h>
+#include <arpa/inet.h>
 #include <bpf/libbpf.h>
 #include "argus.skel.h"
 #include "argus.h"
@@ -14,19 +15,58 @@ static void sig_handler(int sig)
     running = 0;
 }
 
+static void print_header(void)
+{
+    printf("Tracing (EXEC, OPEN, EXIT, CONNECT)... Hit Ctrl-C to stop.\n\n");
+    printf("%-5s  %-6s  %-6s  %-4s  %-4s  %-16s  %s\n",
+           "TYPE", "PID", "PPID", "UID", "GID", "COMM", "DETAIL");
+    printf("%-5s  %-6s  %-6s  %-4s  %-4s  %-16s  %s\n",
+           "-----", "------", "------", "----", "----",
+           "----------------", "------");
+}
+
+static void print_event(const event_t *e)
+{
+    /* common prefix */
+    printf("%-5s  %-6d  %-6d  %-4u  %-4u  %-16s  ",
+           e->type == EVENT_EXEC    ? "EXEC"  :
+           e->type == EVENT_OPEN    ? "OPEN"  :
+           e->type == EVENT_EXIT    ? "EXIT"  :
+           e->type == EVENT_CONNECT ? "CONN"  : "?",
+           e->pid, e->ppid, e->uid, e->gid, e->comm);
+
+    switch (e->type) {
+    case EVENT_EXEC:
+        printf("%s %s", e->filename, e->args);
+        break;
+    case EVENT_OPEN:
+        printf("[%s] %s",
+               e->success ? "OK" : "FAIL",
+               e->filename);
+        break;
+    case EVENT_EXIT:
+        printf("exit_code=%d", e->exit_code);
+        break;
+    case EVENT_CONNECT: {
+        char addr[INET6_ADDRSTRLEN] = {};
+        if (e->family == AF_INET)
+            inet_ntop(AF_INET,  e->daddr, addr, sizeof(addr));
+        else
+            inet_ntop(AF_INET6, e->daddr, addr, sizeof(addr));
+        printf("[%s] %s:%u",
+               e->success ? "OK" : "FAIL",
+               addr, e->dport);
+        break;
+    }
+    }
+    putchar('\n');
+}
+
 static int handle_event(void *ctx, void *data, size_t data_sz)
 {
     (void)ctx;
     (void)data_sz;
-    const event_t *e = data;
-
-    printf("%-7d  %-7d  %-16s  %-10llu  %-4s  %s\n",
-           e->pid,
-           e->ppid,
-           e->comm,
-           (unsigned long long)e->duration_ns,
-           e->success ? "OK" : "FAIL",
-           e->filename);
+    print_event((const event_t *)data);
     return 0;
 }
 
@@ -39,7 +79,6 @@ int main(void)
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
 
-    /* Silence libbpf debug output */
     libbpf_set_print(NULL);
 
     skel = argus_bpf__open_and_load();
@@ -61,12 +100,7 @@ int main(void)
         goto cleanup;
     }
 
-    printf("Tracing execve... Hit Ctrl-C to stop.\n\n");
-    printf("%-7s  %-7s  %-16s  %-10s  %-4s  %s\n",
-           "PID", "PPID", "COMM", "DURATION_NS", "STATUS", "FILENAME");
-    printf("%-7s  %-7s  %-16s  %-10s  %-4s  %s\n",
-           "-------", "-------", "----------------", "----------", "----",
-           "--------");
+    print_header();
 
     while (running) {
         err = ring_buffer__poll(rb, 100 /* ms timeout */);

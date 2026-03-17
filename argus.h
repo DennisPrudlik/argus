@@ -7,14 +7,37 @@
 #include <stdbool.h>
 #endif
 
-// Task communication structure
+typedef enum {
+    EVENT_EXEC    = 0,
+    EVENT_OPEN    = 1,
+    EVENT_EXIT    = 2,
+    EVENT_CONNECT = 3,
+} event_type_t;
+
 typedef struct event {
-    int pid;
-    int ppid;
-    uint64_t duration_ns;
-    char comm[16];
-    char filename[128];
-    bool success;
+    /* ── common fields ─────────────────────────────────── */
+    uint64_t     duration_ns;
+    event_type_t type;
+    int          pid;
+    int          ppid;
+    uint32_t     uid;
+    uint32_t     gid;
+    bool         success;
+    char         comm[16];
+
+    /* ── EVENT_EXEC / EVENT_OPEN ────────────────────────── */
+    char         filename[128];
+
+    /* ── EVENT_EXEC only ────────────────────────────────── */
+    char         args[256];   /* space-separated argv[1..N] */
+
+    /* ── EVENT_EXIT only ────────────────────────────────── */
+    int          exit_code;   /* raw kernel exit_code >> 8  */
+
+    /* ── EVENT_CONNECT only ─────────────────────────────── */
+    uint8_t      family;      /* AF_INET (2) or AF_INET6 (10) */
+    uint16_t     dport;       /* destination port, host byte order */
+    uint8_t      daddr[16];   /* IPv4 in first 4 bytes, IPv6 uses all 16 */
 } event_t;
 
 #endif /* __ARGUS_H */

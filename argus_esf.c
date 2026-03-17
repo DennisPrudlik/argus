@@ -1,77 +1,148 @@
 /*
  * argus_esf.c — macOS Endpoint Security Framework backend
  *
- * Captures ES_EVENT_TYPE_NOTIFY_EXEC events and emits them as event_t
- * structs, matching the same output format as the Linux eBPF backend.
+ * Event coverage:
+ *   EVENT_EXEC — ES_EVENT_TYPE_NOTIFY_EXEC  (macOS 10.15+)
+ *   EVENT_OPEN — ES_EVENT_TYPE_NOTIFY_OPEN  (macOS 10.15+)
+ *   EVENT_EXIT — ES_EVENT_TYPE_NOTIFY_EXIT  (macOS 10.15+)
+ *
+ * NOTE: EVENT_CONNECT is not available via ESF. Network monitoring on macOS
+ * requires the Network Extension framework (NEFilterDataProvider /
+ * NEAppProxyProvider), which is a separate implementation.
  *
  * Requirements:
- *   - macOS 10.15+
- *   - Binary must be signed with the entitlement:
- *       com.apple.developer.endpoint-security.client
- *   - Must run as root (or have TCC Full Disk Access)
+ *   - Binary signed with com.apple.developer.endpoint-security.client
+ *   - Must run as root
  *
  * Build:
  *   clang -g -Wall -o argus_esf argus_esf.c \
  *         -framework EndpointSecurity -lbsm
  *
- * Code-sign (after obtaining entitlement from Apple):
- *   codesign --entitlements argus.entitlements -s "Developer ID" argus_esf
- *
- * NOTE: duration_ns is always 0 on macOS — NOTIFY_EXEC fires after exec
- * has already completed; AUTH_EXEC would allow timing but requires
- * responding to every event (allow/deny), which is out of scope here.
+ * NOTE: duration_ns is always 0 for all events — NOTIFY_* fires after the
+ * fact. AUTH_* variants allow timing but require responding allow/deny.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <arpa/inet.h>
+#include <sys/wait.h>
 #include <bsm/libbsm.h>
 #include <EndpointSecurity/EndpointSecurity.h>
 #include <dispatch/dispatch.h>
 #include "argus.h"
 
-static void print_header(void)
+/* ── helpers ────────────────────────────────────────────────────────────── */
+
+static void fill_common(event_t *e, const es_process_t *proc,
+                         event_type_t type)
 {
-    printf("Tracing execve via ESF... Hit Ctrl-C to stop.\n\n");
-    printf("%-7s  %-7s  %-16s  %-10s  %-4s  %s\n",
-           "PID", "PPID", "COMM", "DURATION_NS", "STATUS", "FILENAME");
-    printf("%-7s  %-7s  %-16s  %-10s  %-4s  %s\n",
-           "-------", "-------", "----------------", "----------",
-           "----", "--------");
+    e->type        = type;
+    e->pid         = audit_token_to_pid(proc->audit_token);
+    e->ppid        = proc->ppid;
+    e->uid         = audit_token_to_euid(proc->audit_token);
+    e->gid         = audit_token_to_egid(proc->audit_token);
+    e->duration_ns = 0;
+    e->success     = true;
+
+    const char *path = proc->executable->path.data;
+    const char *base = strrchr(path, '/');
+    strncpy(e->comm, base ? base + 1 : path, sizeof(e->comm) - 1);
 }
 
-static void print_event(const event_t *e)
-{
-    printf("%-7d  %-7d  %-16s  %-10llu  %-4s  %s\n",
-           e->pid,
-           e->ppid,
-           e->comm,
-           (unsigned long long)e->duration_ns,
-           e->success ? "OK" : "FAIL",
-           e->filename);
-}
+/* ── event handlers ─────────────────────────────────────────────────────── */
 
 static void handle_exec(const es_message_t *msg)
 {
-    const es_process_t *proc = msg->event.exec.target;
     event_t e = {};
+    const es_process_t *proc = msg->event.exec.target;
+    fill_common(&e, proc, EVENT_EXEC);
 
-    e.pid        = audit_token_to_pid(proc->audit_token);
-    e.ppid       = proc->ppid;
-    e.duration_ns = 0;   /* not available for NOTIFY events */
-    e.success    = true; /* NOTIFY_EXEC only fires on success */
+    strncpy(e.filename, proc->executable->path.data,
+            sizeof(e.filename) - 1);
 
-    /* Executable path -> filename */
-    const char *path = proc->executable->path.data;
-    strncpy(e.filename, path, sizeof(e.filename) - 1);
-
-    /* Derive comm from basename of path */
-    const char *base = strrchr(path, '/');
-    strncpy(e.comm, base ? base + 1 : path, sizeof(e.comm) - 1);
+    /* argv[1..N] → space-separated args (requires macOS 11.0+) */
+    uint32_t argc = es_exec_arg_count(&msg->event.exec);
+    int off = 0;
+    for (uint32_t i = 1; i < argc; i++) {
+        es_string_token_t arg = es_exec_arg(&msg->event.exec, i);
+        int rem = (int)sizeof(e.args) - off - 1;
+        if (rem <= 0)
+            break;
+        int n = snprintf(e.args + off, rem, "%.*s",
+                         (int)arg.length, arg.data);
+        if (n <= 0)
+            break;
+        off += n;
+        if (off < (int)sizeof(e.args) - 1 && i + 1 < argc)
+            e.args[off++] = ' ';
+    }
 
     print_event(&e);
 }
+
+static void handle_open(const es_message_t *msg)
+{
+    event_t e = {};
+    fill_common(&e, msg->process, EVENT_OPEN);
+
+    strncpy(e.filename, msg->event.open.file->path.data,
+            sizeof(e.filename) - 1);
+
+    print_event(&e);
+}
+
+static void handle_exit(const es_message_t *msg)
+{
+    event_t e = {};
+    fill_common(&e, msg->process, EVENT_EXIT);
+
+    int stat = msg->event.exit.stat;
+    if (WIFEXITED(stat))
+        e.exit_code = WEXITSTATUS(stat);
+    else if (WIFSIGNALED(stat))
+        e.exit_code = -WTERMSIG(stat); /* negative = killed by signal */
+
+    print_event(&e);
+}
+
+/* ── printer ────────────────────────────────────────────────────────────── */
+
+void print_event(const event_t *e)
+{
+    /* common prefix */
+    printf("%-5s  %-6d  %-6d  %-4u  %-4u  %-16s  ",
+           e->type == EVENT_EXEC    ? "EXEC"    :
+           e->type == EVENT_OPEN    ? "OPEN"    :
+           e->type == EVENT_EXIT    ? "EXIT"    :
+           e->type == EVENT_CONNECT ? "CONN"    : "?",
+           e->pid, e->ppid, e->uid, e->gid, e->comm);
+
+    switch (e->type) {
+    case EVENT_EXEC:
+        printf("%s %s", e->filename, e->args);
+        break;
+    case EVENT_OPEN:
+        printf("%s", e->filename);
+        break;
+    case EVENT_EXIT:
+        printf("exit_code=%d", e->exit_code);
+        break;
+    case EVENT_CONNECT: {
+        char addr[INET6_ADDRSTRLEN] = {};
+        if (e->family == AF_INET)
+            inet_ntop(AF_INET,  e->daddr, addr, sizeof(addr));
+        else
+            inet_ntop(AF_INET6, e->daddr, addr, sizeof(addr));
+        printf("%s:%u", addr, e->dport);
+        break;
+    }
+    }
+    putchar('\n');
+}
+
+/* ── main ───────────────────────────────────────────────────────────────── */
 
 int main(void)
 {
@@ -80,15 +151,19 @@ int main(void)
     es_new_client_result_t res = es_new_client(&client,
         ^(es_client_t *c, const es_message_t *msg) {
             (void)c;
-            if (msg->event_type == ES_EVENT_TYPE_NOTIFY_EXEC)
-                handle_exec(msg);
+            switch (msg->event_type) {
+            case ES_EVENT_TYPE_NOTIFY_EXEC: handle_exec(msg); break;
+            case ES_EVENT_TYPE_NOTIFY_OPEN: handle_open(msg); break;
+            case ES_EVENT_TYPE_NOTIFY_EXIT: handle_exit(msg); break;
+            default: break;
+            }
         });
 
     switch (res) {
     case ES_NEW_CLIENT_RESULT_SUCCESS:
         break;
     case ES_NEW_CLIENT_RESULT_ERR_NOT_PERMITTED:
-        fprintf(stderr, "error: not permitted — binary must be signed with "
+        fprintf(stderr, "error: binary must be signed with "
                         "com.apple.developer.endpoint-security.client\n");
         return 1;
     case ES_NEW_CLIENT_RESULT_ERR_NOT_PRIVILEGED:
@@ -99,14 +174,17 @@ int main(void)
         return 1;
     }
 
-    es_event_type_t subs[] = { ES_EVENT_TYPE_NOTIFY_EXEC };
-    if (es_subscribe(client, subs, 1) != ES_RETURN_SUCCESS) {
+    es_event_type_t subs[] = {
+        ES_EVENT_TYPE_NOTIFY_EXEC,
+        ES_EVENT_TYPE_NOTIFY_OPEN,
+        ES_EVENT_TYPE_NOTIFY_EXIT,
+    };
+    if (es_subscribe(client, subs, 3) != ES_RETURN_SUCCESS) {
         fprintf(stderr, "error: es_subscribe failed\n");
         es_delete_client(client);
         return 1;
     }
 
-    /* Use dispatch sources for clean Ctrl-C / SIGTERM shutdown */
     signal(SIGINT,  SIG_IGN);
     signal(SIGTERM, SIG_IGN);
 
@@ -129,7 +207,14 @@ int main(void)
     dispatch_source_set_event_handler(src_term, shutdown);
     dispatch_resume(src_term);
 
-    print_header();
-    dispatch_main(); /* blocks; ESF callbacks delivered on internal queue */
+    printf("Tracing via ESF (EXEC, OPEN, EXIT)... Ctrl-C to stop.\n\n");
+    printf("  NOTE: CONNECT not available via ESF — use Network Extension for network telemetry.\n\n");
+    printf("%-5s  %-6s  %-6s  %-4s  %-4s  %-16s  %s\n",
+           "TYPE", "PID", "PPID", "UID", "GID", "COMM", "DETAIL");
+    printf("%-5s  %-6s  %-6s  %-4s  %-4s  %-16s  %s\n",
+           "-----", "------", "------", "----", "----",
+           "----------------", "------");
+
+    dispatch_main();
     return 0;
 }
