@@ -26,4 +26,11 @@ int  event_matches(const event_t *e);
 /* Emit one event in the configured format */
 void print_event(const event_t *e);
 
+/*
+ * Report that 'count' events were dropped by the kernel ring buffer.
+ * Text mode: warning to stderr.
+ * JSON mode: {"type":"DROP","count":<n>} to stdout so consumers see it inline.
+ */
+void print_drops(uint64_t count);
+
 #endif /* __OUTPUT_H */

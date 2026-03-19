@@ -16,6 +16,27 @@ struct {
     __uint(max_entries, 256 * 1024);
 } rb SEC(".maps");
 
+/* ── Drop counter ───────────────────────────────────────────────────────── */
+
+/*
+ * Incremented every time bpf_ringbuf_reserve fails (ring buffer full).
+ * Userspace reads this after each poll() interval and reports the delta.
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, uint32_t);
+    __type(value, uint64_t);
+} dropped SEC(".maps");
+
+static __always_inline void note_drop(void)
+{
+    uint32_t zero = 0;
+    uint64_t *cnt = bpf_map_lookup_elem(&dropped, &zero);
+    if (cnt)
+        __sync_fetch_and_add(cnt, 1);
+}
+
 /* ── Kernel-side filter maps ────────────────────────────────────────────── */
 
 /*
@@ -162,8 +183,10 @@ int handle_execve_exit(struct trace_event_raw_sys_exit *ctx)
         goto cleanup;
 
     event_t *e = bpf_ringbuf_reserve(&rb, sizeof(event_t), 0);
-    if (!e)
+    if (!e) {
+        note_drop();
         goto cleanup;
+    }
 
     e->type        = EVENT_EXEC;
     e->pid         = pid;
@@ -237,8 +260,10 @@ int handle_openat_exit(struct trace_event_raw_sys_exit *ctx)
         goto cleanup;
 
     event_t *e = bpf_ringbuf_reserve(&rb, sizeof(event_t), 0);
-    if (!e)
+    if (!e) {
+        note_drop();
         goto cleanup;
+    }
 
     e->type        = EVENT_OPEN;
     e->pid         = pid;
@@ -276,8 +301,10 @@ int handle_process_exit(struct trace_event_raw_sched_process_template *ctx)
         return 0;
 
     event_t *e = bpf_ringbuf_reserve(&rb, sizeof(event_t), 0);
-    if (!e)
+    if (!e) {
+        note_drop();
         return 0;
+    }
 
     e->type    = EVENT_EXIT;
     e->pid     = pid;
@@ -368,8 +395,10 @@ int handle_connect_exit(struct trace_event_raw_sys_exit *ctx)
         goto cleanup;
 
     event_t *e = bpf_ringbuf_reserve(&rb, sizeof(event_t), 0);
-    if (!e)
+    if (!e) {
+        note_drop();
         goto cleanup;
+    }
 
     e->type        = EVENT_CONNECT;
     e->pid         = pid;

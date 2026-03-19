@@ -165,3 +165,13 @@ void print_event(const event_t *e)
     else
         text_event(e);
 }
+
+void print_drops(uint64_t count)
+{
+    if (g_fmt == OUTPUT_JSON)
+        printf("{\"type\":\"DROP\",\"count\":%llu}\n",
+               (unsigned long long)count);
+    else
+        fprintf(stderr, "[WARNING: %llu event(s) dropped — ring buffer full]\n",
+                (unsigned long long)count);
+}

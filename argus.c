@@ -11,6 +11,19 @@
 #include "output.h"
 
 static volatile int running = 1;
+static uint64_t last_drops = 0;
+
+static void check_drops(int map_fd)
+{
+    uint32_t key  = 0;
+    uint64_t drops = 0;
+    if (bpf_map_lookup_elem(map_fd, &key, &drops))
+        return;
+    if (drops > last_drops) {
+        print_drops(drops - last_drops);
+        last_drops = drops;
+    }
+}
 
 static void sig_handler(int sig)
 {
@@ -137,6 +150,8 @@ int main(int argc, char **argv)
 
     print_header("eBPF");
 
+    int drop_fd = bpf_map__fd(skel->maps.dropped);
+
     while (running) {
         err = ring_buffer__poll(rb, 100);
         if (err == -EINTR) { err = 0; break; }
@@ -144,7 +159,11 @@ int main(int argc, char **argv)
             fprintf(stderr, "error: ring buffer poll failed: %d\n", err);
             break;
         }
+        check_drops(drop_fd);
     }
+
+    /* Final check — catch any drops that landed in the last poll window */
+    check_drops(drop_fd);
 
     ring_buffer__free(rb);
 cleanup:
