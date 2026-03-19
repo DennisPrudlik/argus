@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <getopt.h>
 #include <bpf/libbpf.h>
+#include <bpf/bpf.h>
 #include "argus.skel.h"
 #include "argus.h"
 #include "output.h"
@@ -29,6 +30,41 @@ static void usage(const char *prog)
         "  --json         Emit newline-delimited JSON instead of text\n"
         "  --help         Show this message\n",
         prog);
+}
+
+/*
+ * Populate the BPF filter maps from the parsed CLI filter.
+ * Must be called after argus_bpf__open_and_load() and before
+ * argus_bpf__attach() so the maps are ready before any events fire.
+ *
+ * pid and comm filters are enforced in-kernel; path is still userspace-only
+ * (prefix/substring matching in BPF requires a trie which is a future step).
+ */
+static void setup_bpf_filters(struct argus_bpf *skel, const filter_t *f)
+{
+    argus_config_t cfg = {};
+    uint32_t zero = 0;
+
+    if (f->pid != 0) {
+        uint32_t pid = (uint32_t)f->pid;
+        uint8_t  val = 1;
+        bpf_map_update_elem(bpf_map__fd(skel->maps.filter_pids),
+                            &pid, &val, BPF_ANY);
+        cfg.filter_pid_active = 1;
+    }
+
+    if (f->comm[0] != '\0') {
+        char key[16] = {};
+        strncpy(key, f->comm, sizeof(key) - 1);
+        uint8_t val = 1;
+        bpf_map_update_elem(bpf_map__fd(skel->maps.filter_comms),
+                            key, &val, BPF_ANY);
+        cfg.filter_comm_active = 1;
+    }
+
+    if (cfg.filter_pid_active || cfg.filter_comm_active)
+        bpf_map_update_elem(bpf_map__fd(skel->maps.config_map),
+                            &zero, &cfg, BPF_ANY);
 }
 
 static int handle_event(void *ctx, void *data, size_t data_sz)
@@ -83,6 +119,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "error: failed to open/load BPF skeleton\n");
         return 1;
     }
+
+    setup_bpf_filters(skel, &filter);
 
     err = argus_bpf__attach(skel);
     if (err) {

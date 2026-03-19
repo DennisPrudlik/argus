@@ -40,4 +40,13 @@ typedef struct event {
     uint8_t      daddr[16];   /* IPv4 in first 4 bytes, IPv6 uses all 16 */
 } event_t;
 
+/*
+ * BPF filter configuration — written by userspace into config_map[0],
+ * read by every BPF handler via should_drop().
+ */
+typedef struct argus_config {
+    uint8_t filter_pid_active;   /* 1 = only pass PIDs in filter_pids  */
+    uint8_t filter_comm_active;  /* 1 = only pass comms in filter_comms */
+} argus_config_t;
+
 #endif /* __ARGUS_H */

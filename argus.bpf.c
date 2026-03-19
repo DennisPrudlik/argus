@@ -1,4 +1,8 @@
 #include "vmlinux.h"
+/* __user is a sparse annotation — not always defined by older vmlinux.h */
+#ifndef __user
+#define __user
+#endif
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
@@ -11,6 +15,67 @@ struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 256 * 1024);
 } rb SEC(".maps");
+
+/* ── Kernel-side filter maps ────────────────────────────────────────────── */
+
+/*
+ * config_map[0] holds active filter flags set by userspace at startup.
+ * Checked in should_drop() before any ring buffer reservation.
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, uint32_t);
+    __type(value, argus_config_t);
+} config_map SEC(".maps");
+
+/* Allowlist of PIDs to trace (only consulted when filter_pid_active=1) */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, uint32_t);    /* pid  */
+    __type(value, uint8_t);   /* 1    */
+} filter_pids SEC(".maps");
+
+/* Allowlist of comm strings to trace (only consulted when filter_comm_active=1) */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, char[16]);    /* null-padded comm */
+    __type(value, uint8_t);   /* 1                */
+} filter_comms SEC(".maps");
+
+/*
+ * should_drop_pid — called in ENTER handlers (before comm is available).
+ * Returns 1 if the event should be silently discarded, 0 to keep it.
+ */
+static __always_inline int should_drop_pid(uint32_t pid)
+{
+    uint32_t zero = 0;
+    argus_config_t *cfg = bpf_map_lookup_elem(&config_map, &zero);
+    if (!cfg)
+        return 0;
+    if (cfg->filter_pid_active && !bpf_map_lookup_elem(&filter_pids, &pid))
+        return 1;
+    return 0;
+}
+
+/*
+ * should_drop — called in EXIT handlers once comm is known.
+ * Checks both pid and comm allowlists.
+ */
+static __always_inline int should_drop(uint32_t pid, char comm[16])
+{
+    uint32_t zero = 0;
+    argus_config_t *cfg = bpf_map_lookup_elem(&config_map, &zero);
+    if (!cfg)
+        return 0;
+    if (cfg->filter_pid_active && !bpf_map_lookup_elem(&filter_pids, &pid))
+        return 1;
+    if (cfg->filter_comm_active && !bpf_map_lookup_elem(&filter_comms, comm))
+        return 1;
+    return 0;
+}
 
 /* ══════════════════════════════════════════════════════════════════════════
  * EVENT_EXEC — tracepoint/syscalls/sys_{enter,exit}_execve
@@ -55,35 +120,29 @@ int handle_execve_enter(struct trace_event_raw_sys_enter *ctx)
     bpf_probe_read_user_str(es->filename, sizeof(es->filename),
                             (const char *)ctx->args[0]);
 
-    /* argv[1..15] → space-separated args buffer */
-    const char __user *const __user *argv =
-        (const char *const *)ctx->args[1];
-    int off = 0;
+    /*
+     * argv[1..8] → args buffer, 8 fixed 31-char slots separated by spaces.
+     * Layout: [arg1:31][ ][arg2:31][ ] ... (8 × 32 = 256 bytes)
+     *
+     * Fixed slot offsets let the BPF verifier statically prove all map-value
+     * accesses are in-bounds, avoiding verifier rejection on kernels ≤ 5.15
+     * that cannot track dynamic offset arithmetic through loops.
+     */
+    const char *const *argv = (const char *const *)ctx->args[1];
 
-    for (int i = 1; i < 16; i++) {
-        const char __user *argp = NULL;
-        if (bpf_probe_read_user(&argp, sizeof(argp), &argv[i]))
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        const char *argp = NULL;
+        if (bpf_probe_read_user(&argp, sizeof(argp), &argv[i + 1]) || !argp)
             break;
-        if (!argp)
-            break;
-
-        int rem = (int)sizeof(es->args) - off - 1;
-        if (rem <= 0)
-            break;
-
-        int safe_off = off & (sizeof(es->args) - 1);
-        int n = bpf_probe_read_user_str(es->args + safe_off, rem, argp);
-        if (n <= 0)
-            break;
-
-        off += n;
-        if (off > 0 && off < (int)sizeof(es->args)) {
-            int sep = (off - 1) & (sizeof(es->args) - 1);
-            es->args[sep] = ' ';
-        }
+        bpf_probe_read_user_str(es->args + i * 32, 31, argp);
+        if (i < 7)
+            es->args[i * 32 + 31] = ' ';
     }
 
     uint32_t pid = bpf_get_current_pid_tgid() >> 32;
+    if (should_drop_pid(pid))
+        return 0;
     bpf_map_update_elem(&execs, &pid, es, BPF_ANY);
     return 0;
 }
@@ -95,6 +154,11 @@ int handle_execve_exit(struct trace_event_raw_sys_exit *ctx)
 
     struct exec_start *es = bpf_map_lookup_elem(&execs, &pid);
     if (!es)
+        goto cleanup;
+
+    char comm[16] = {};
+    bpf_get_current_comm(comm, sizeof(comm));
+    if (should_drop(pid, comm))
         goto cleanup;
 
     event_t *e = bpf_ringbuf_reserve(&rb, sizeof(event_t), 0);
@@ -113,7 +177,7 @@ int handle_execve_exit(struct trace_event_raw_sys_exit *ctx)
     e->uid = (uint32_t)(uid_gid);
     e->gid = (uint32_t)(uid_gid >> 32);
 
-    bpf_get_current_comm(e->comm, sizeof(e->comm));
+    __builtin_memcpy(e->comm, comm, sizeof(e->comm));
     __builtin_memcpy(e->filename, es->filename, sizeof(e->filename));
     __builtin_memcpy(e->args,     es->args,     sizeof(e->args));
 
@@ -151,6 +215,8 @@ int handle_openat_enter(struct trace_event_raw_sys_enter *ctx)
                             (const char *)ctx->args[1]);
 
     uint64_t id = bpf_get_current_pid_tgid();
+    if (should_drop_pid((uint32_t)(id >> 32)))
+        return 0;
     bpf_map_update_elem(&opens, &id, &os, BPF_ANY);
     return 0;
 }
@@ -164,12 +230,18 @@ int handle_openat_exit(struct trace_event_raw_sys_exit *ctx)
     if (!os)
         goto cleanup;
 
+    uint32_t pid = (uint32_t)(id >> 32);
+    char comm[16] = {};
+    bpf_get_current_comm(comm, sizeof(comm));
+    if (should_drop(pid, comm))
+        goto cleanup;
+
     event_t *e = bpf_ringbuf_reserve(&rb, sizeof(event_t), 0);
     if (!e)
         goto cleanup;
 
     e->type        = EVENT_OPEN;
-    e->pid         = (uint32_t)(id >> 32);
+    e->pid         = pid;
     e->duration_ns = bpf_ktime_get_ns() - os->ts;
     e->success     = (ctx->ret >= 0);
 
@@ -180,7 +252,7 @@ int handle_openat_exit(struct trace_event_raw_sys_exit *ctx)
     e->uid = (uint32_t)(uid_gid);
     e->gid = (uint32_t)(uid_gid >> 32);
 
-    bpf_get_current_comm(e->comm, sizeof(e->comm));
+    __builtin_memcpy(e->comm, comm, sizeof(e->comm));
     __builtin_memcpy(e->filename, os->filename, sizeof(e->filename));
 
     bpf_ringbuf_submit(e, 0);
@@ -197,12 +269,18 @@ cleanup:
 SEC("tracepoint/sched/sched_process_exit")
 int handle_process_exit(struct trace_event_raw_sched_process_template *ctx)
 {
+    uint32_t pid = bpf_get_current_pid_tgid() >> 32;
+    char comm[16] = {};
+    bpf_get_current_comm(comm, sizeof(comm));
+    if (should_drop(pid, comm))
+        return 0;
+
     event_t *e = bpf_ringbuf_reserve(&rb, sizeof(event_t), 0);
     if (!e)
         return 0;
 
     e->type    = EVENT_EXIT;
-    e->pid     = bpf_get_current_pid_tgid() >> 32;
+    e->pid     = pid;
     e->success = true;
 
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
@@ -213,7 +291,7 @@ int handle_process_exit(struct trace_event_raw_sched_process_template *ctx)
     e->uid = (uint32_t)(uid_gid);
     e->gid = (uint32_t)(uid_gid >> 32);
 
-    bpf_get_current_comm(e->comm, sizeof(e->comm));
+    __builtin_memcpy(e->comm, comm, sizeof(e->comm));
 
     bpf_ringbuf_submit(e, 0);
     return 0;
@@ -268,6 +346,8 @@ int handle_connect_enter(struct trace_event_raw_sys_enter *ctx)
     }
 
     uint64_t id = bpf_get_current_pid_tgid();
+    if (should_drop_pid((uint32_t)(id >> 32)))
+        return 0;
     bpf_map_update_elem(&connects, &id, &cs, BPF_ANY);
     return 0;
 }
@@ -281,12 +361,18 @@ int handle_connect_exit(struct trace_event_raw_sys_exit *ctx)
     if (!cs)
         goto cleanup;
 
+    uint32_t pid = (uint32_t)(id >> 32);
+    char comm[16] = {};
+    bpf_get_current_comm(comm, sizeof(comm));
+    if (should_drop(pid, comm))
+        goto cleanup;
+
     event_t *e = bpf_ringbuf_reserve(&rb, sizeof(event_t), 0);
     if (!e)
         goto cleanup;
 
     e->type        = EVENT_CONNECT;
-    e->pid         = (uint32_t)(id >> 32);
+    e->pid         = pid;
     e->duration_ns = bpf_ktime_get_ns() - cs->ts;
     /* connect returns 0 on success, or -EINPROGRESS for non-blocking */
     e->success     = (ctx->ret == 0 || ctx->ret == -115 /* EINPROGRESS */);
@@ -301,7 +387,7 @@ int handle_connect_exit(struct trace_event_raw_sys_exit *ctx)
     e->uid = (uint32_t)(uid_gid);
     e->gid = (uint32_t)(uid_gid >> 32);
 
-    bpf_get_current_comm(e->comm, sizeof(e->comm));
+    __builtin_memcpy(e->comm, comm, sizeof(e->comm));
 
     bpf_ringbuf_submit(e, 0);
 
