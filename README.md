@@ -42,20 +42,21 @@ Build steps performed by `make`:
 ### System-wide install
 
 ```sh
-sudo make install      # installs to /usr/local/bin/argus + /etc/systemd/system/argus.service
-sudo make uninstall    # removes both
+sudo make install      # installs binary, systemd unit, tmpfiles.d, and logrotate config
+sudo make uninstall    # removes all of the above
 ```
 
 To run as a persistent daemon:
 
 ```sh
+sudo systemd-tmpfiles --create        # creates /var/log/argus/ (done once)
 sudo systemctl daemon-reload
 sudo systemctl enable --now argus
-journalctl -u argus -f       # live log
-cat /var/log/argus/events.jsonl  # persistent JSONL output
+journalctl -u argus -f                # live log
+cat /var/log/argus/events.jsonl       # persistent JSONL output
 ```
 
-The service writes JSON to `/var/log/argus/events.jsonl`, drops privileges to `nobody` after attach, and restarts automatically on failure.
+The service writes JSON to `/var/log/argus/events.jsonl`, drops privileges to `nobody` after attach, and restarts automatically on failure. Log rotation is configured via the installed `logrotate` config (daily, 14 days, compressed).
 
 ## Usage
 
@@ -75,6 +76,7 @@ sudo ./argus [OPTIONS]
 | `--summary <secs>` | Rolling summary every N seconds instead of per-event output |
 | `--json` | Emit newline-delimited JSON instead of a text table |
 | `--no-drop-privs` | Stay root after attach (not recommended) |
+| `--config-check` | Validate config file(s) and print active settings, then exit |
 | `--version` | Print version and exit |
 | `--help` | Show usage |
 
@@ -232,15 +234,44 @@ limactl show-ssh --format config argus >> ~/.ssh/config
 # Unit tests — no root, no kernel required
 make test
 
+# Unit tests with AddressSanitizer + UBSan
+make test-asan
+
 # Integration tests — requires root and a built argus binary
 make test-integration
 ```
 
 Unit tests cover `event_matches` filter logic (pid, comm, path, excludes, event mask) and the lineage cache (chain building, tombstone deletion, buffer truncation). Integration tests start argus with `--pid`, `--comm`, `--events`, and `--exclude` filters against live kernel events and verify only matching events appear in the output.
 
+## Performance tuning
+
+**Ring buffer size** — The default 256 KB is enough for most workloads. On busy servers (many short-lived processes or high file open rates) you may see drop warnings. Increase with `--ringbuf 1024` or via the config file. The kernel requires the size to be a power-of-2 multiple of the page size; libbpf rounds up automatically.
+
+**Kernel-side vs userspace filters** — `--pid` and `--comm` are enforced inside the BPF programs before events enter the ring buffer, so they add near-zero overhead even on noisy hosts. `--path`, `--exclude`, and `--events` are cheaper than running with no filter at all (`--events` prevents unused BPF programs from loading entirely) but still copy events to userspace first.
+
+**Summary mode** — `--summary 60` trades per-event latency for dramatically lower output volume on high-event-rate hosts. Recommended for long-running daemon deployments where detailed event streams would flood the log.
+
+## Troubleshooting
+
+**`error: failed to open BPF skeleton`** — The binary cannot load the embedded BPF object. Ensure you're running as root (or have `CAP_BPF` + `CAP_PERFMON`) and that the kernel is 5.8+.
+
+**`ls: cannot access '/sys/kernel/btf/vmlinux': No such file or directory`** — Your kernel was built without BTF. On Ubuntu, install `linux-image-$(uname -r)` from the main repository (not a custom kernel). Check with `zcat /proc/config.gz | grep CONFIG_DEBUG_INFO_BTF`.
+
+**BPF verifier error on load** — Usually seen on kernels older than 5.15 with strict verifier bounds checking. The `#pragma unroll` arg-capture loop in `argus.bpf.c` is already tuned for 5.15. If you hit this on an even older kernel, reduce `ARGUS_MAX_ARGS` in `argus.bpf.c` and rebuild.
+
+**`warning: could not drop privileges`** — The `nobody` user does not exist on this system. Argus continues as root. Add the user with `useradd -r -s /sbin/nologin nobody` or pass `--no-drop-privs` to suppress the warning.
+
+**High drop rate** — Increase `--ringbuf` and/or add `--pid` / `--comm` / `--events` filters to reduce event volume. Drop counts appear in text output as `[WARNING: N event(s) dropped]` and inline in JSON as `{"type":"DROP","count":N}`.
+
+**Validate your config before deploying:**
+
+```sh
+./argus --config /etc/argus/config.json --config-check
+```
+
 ## CI
 
-Every push and pull request to `main` runs the full test suite on GitHub Actions (`ubuntu-latest`). The workflow installs all build dependencies, verifies BTF availability, builds the binary, and runs both unit and integration tests.
+Every push and pull request to `main` runs the full test suite on GitHub Actions across two kernel versions (`ubuntu-latest` and `ubuntu-22.04` / kernel 5.15 LTS). Each run installs all build dependencies, verifies BTF availability, builds the binary, and runs unit, ASAN, and integration tests.
 
 ## Repository layout
 
@@ -252,9 +283,11 @@ lineage.c/h          Userspace process ancestry cache
 config.c/h           JSON config file parser
 argus.h              Shared event struct, type definitions, TRACE_* bitmasks
 argus.service        systemd service unit
+argus.tmpfiles       systemd-tmpfiles config for /var/log/argus pre-creation
+argus.logrotate      logrotate config (daily, 14 days, compressed)
 tests/               Unit tests (test_lineage.c, test_output.c) and integration test (test_filter.sh)
 lima/                Lima VM config for development on non-Linux hosts
 .devcontainer/       VS Code Dev Container config (alternative to Lima)
-.github/workflows/   GitHub Actions CI
-Makefile             Build entry point (targets: all, test, test-integration, install, clean)
+.github/workflows/   GitHub Actions CI (ubuntu-latest + ubuntu-22.04 matrix)
+Makefile             Build entry point (targets: all, test, test-asan, test-integration, install, clean)
 ```

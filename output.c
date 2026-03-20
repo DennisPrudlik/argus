@@ -121,14 +121,19 @@ static void text_event(const event_t *e)
 static void json_str(const char *s)
 {
     putchar('"');
-    for (; *s; s++) {
-        switch (*s) {
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        switch (*p) {
         case '"':  printf("\\\""); break;
         case '\\': printf("\\\\"); break;
         case '\n': printf("\\n");  break;
         case '\r': printf("\\r");  break;
         case '\t': printf("\\t");  break;
-        default:   putchar(*s);    break;
+        default:
+            if (*p < 0x20)
+                printf("\\u%04x", *p);   /* escape control characters */
+            else
+                putchar(*p);
+            break;
         }
     }
     putchar('"');

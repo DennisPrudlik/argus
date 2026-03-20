@@ -77,6 +77,7 @@ static void usage(const char *prog)
         "  --summary     <secs>  Rolling summary every N seconds\n"
         "  --no-drop-privs       Stay root after attach (not recommended)\n"
         "  --json                Newline-delimited JSON output\n"
+        "  --config-check        Validate config file(s) and print active settings, then exit\n"
         "  --version             Print version and exit\n"
         "  --help                Show this message\n",
         prog);
@@ -198,13 +199,15 @@ int main(int argc, char **argv)
         {"summary",       required_argument, 0, 's'},
         {"no-drop-privs", no_argument,       0, 'n'},
         {"json",          no_argument,       0, 'j'},
+        {"config-check",  no_argument,       0, 'K'},
         {"version",       no_argument,       0, 'V'},
         {"help",          no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
+    int config_check = 0;
     int opt;
-    while ((opt = getopt_long(argc, argv, "C:p:c:P:x:e:r:s:njVh",
+    while ((opt = getopt_long(argc, argv, "C:p:c:P:x:e:r:s:njKVh",
                               long_opts, NULL)) != -1) {
         switch (opt) {
         case 'C':
@@ -218,16 +221,53 @@ int main(int argc, char **argv)
             if (cfg.filter.exclude_count < 8)
                 strncpy(cfg.filter.excludes[cfg.filter.exclude_count++],
                         optarg, 127);
+            else
+                fprintf(stderr, "warning: --exclude limit (8) reached, "
+                                "ignoring '%s'\n", optarg);
             break;
         case 'e': cfg.filter.event_mask = parse_event_list(optarg);               break;
-        case 'r': cfg.ring_buffer_kb    = atoi(optarg);                           break;
+        case 'r': {
+            int kb = atoi(optarg);
+            if (kb < 4 || kb > 65536) {
+                fprintf(stderr, "error: --ringbuf must be between 4 and 65536 KB\n");
+                return 1;
+            }
+            cfg.ring_buffer_kb = kb;
+            break;
+        }
         case 's': cfg.summary_interval  = atoi(optarg);                           break;
         case 'n': no_drop_privs         = 1;                                      break;
         case 'j': fmt                   = OUTPUT_JSON;                             break;
+        case 'K': config_check          = 1;                                       break;
         case 'V': printf("argus %s\n", ARGUS_VERSION); return 0;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 1;
         }
+    }
+
+    if (config_check) {
+        static const char *type_names[] = {"EXEC","OPEN","EXIT","CONNECT"};
+        printf("argus %s — active configuration\n\n", ARGUS_VERSION);
+        printf("  ring_buffer_kb    : %d\n",  cfg.ring_buffer_kb);
+        printf("  summary_interval  : %d\n",  cfg.summary_interval);
+        printf("  filter.pid        : %d\n",  cfg.filter.pid);
+        printf("  filter.comm       : %s\n",  cfg.filter.comm[0] ? cfg.filter.comm : "(none)");
+        printf("  filter.path       : %s\n",  cfg.filter.path[0] ? cfg.filter.path : "(none)");
+        printf("  filter.event_mask : ");
+        int any = 0;
+        for (int i = 0; i < 4; i++)
+            if (cfg.filter.event_mask & (1 << i)) {
+                printf("%s%s", any ? "," : "", type_names[i]);
+                any = 1;
+            }
+        if (!any) printf("ALL");
+        printf("\n");
+        printf("  exclude_paths     :");
+        if (cfg.filter.exclude_count == 0) printf(" (none)");
+        for (int i = 0; i < cfg.filter.exclude_count; i++)
+            printf(" %s", cfg.filter.excludes[i]);
+        printf("\n");
+        return 0;
     }
 
     if (cfg.filter.event_mask == 0)

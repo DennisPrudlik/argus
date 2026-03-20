@@ -19,7 +19,7 @@ LogsDirectoryMode=0750
 # Security hardening
 NoNewPrivileges=yes
 PrivateTmp=yes
-ProtectSystem=strict
+ProtectSystem=full
 ReadWritePaths=/var/log/argus
 
 [Install]

@@ -8,7 +8,10 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
@@ -37,6 +40,9 @@ jobs:
 
       - name: Unit tests
         run: make test
+
+      - name: Unit tests (ASAN/UBSan)
+        run: make test-asan
 
       - name: Integration tests
         run: make test-integration

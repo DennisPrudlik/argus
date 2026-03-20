@@ -8,11 +8,13 @@ BPF_CFLAGS := -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) \
               -I/usr/include/$(shell uname -m)-linux-gnu
 CFLAGS     := -g -Wall -I.
 
-PREFIX  ?= /usr/local
-BINDIR   = $(DESTDIR)$(PREFIX)/bin
-UNITDIR  = $(DESTDIR)/etc/systemd/system
+PREFIX      ?= /usr/local
+BINDIR       = $(DESTDIR)$(PREFIX)/bin
+UNITDIR      = $(DESTDIR)/etc/systemd/system
+TMPFILESDIR  = $(DESTDIR)/usr/lib/tmpfiles.d
+LOGROTATEDIR = $(DESTDIR)/etc/logrotate.d
 
-.PHONY: all clean test test-unit test-integration install uninstall
+.PHONY: all clean test test-unit test-integration test-asan install uninstall
 
 all: argus
 
@@ -50,17 +52,36 @@ test-integration: argus
 	@echo "── filter integration ───────────────────────"
 	sudo bash tests/test_filter.sh ./argus
 
+# ── ASAN / UBSan unit tests ───────────────────────────────────────────────
+ASAN_FLAGS := -fsanitize=address,undefined -fno-omit-frame-pointer
+
+tests/test_lineage_asan: tests/test_lineage.c lineage.c lineage.h argus.h
+	$(CC) $(CFLAGS) $(ASAN_FLAGS) -o $@ tests/test_lineage.c lineage.c
+
+tests/test_output_asan: tests/test_output.c output.c lineage.c output.h lineage.h argus.h
+	$(CC) $(CFLAGS) $(ASAN_FLAGS) -o $@ tests/test_output.c output.c lineage.c
+
+test-asan: tests/test_lineage_asan tests/test_output_asan
+	@echo "── lineage (ASAN) ───────────────────────────────"
+	@./tests/test_lineage_asan
+	@echo "── output / filter (ASAN) ───────────────────────"
+	@./tests/test_output_asan
+
 # Run unit tests only (no root required)
 test: test-unit
 
 install: argus
-	install -Dm755 argus          $(BINDIR)/argus
-	install -Dm644 argus.service  $(UNITDIR)/argus.service
-	@echo "Run: systemctl daemon-reload && systemctl enable --now argus"
+	install -Dm755 argus               $(BINDIR)/argus
+	install -Dm644 argus.service       $(UNITDIR)/argus.service
+	install -Dm644 argus.tmpfiles      $(TMPFILESDIR)/argus.conf
+	install -Dm644 argus.logrotate     $(LOGROTATEDIR)/argus
+	@echo "Run: systemd-tmpfiles --create && systemctl daemon-reload && systemctl enable --now argus"
 
 uninstall:
-	rm -f $(BINDIR)/argus $(UNITDIR)/argus.service
+	rm -f $(BINDIR)/argus $(UNITDIR)/argus.service \
+	      $(TMPFILESDIR)/argus.conf $(LOGROTATEDIR)/argus
 
 clean:
 	rm -f argus argus.bpf.o argus.skel.h vmlinux.h \
-	      tests/test_lineage tests/test_output
+	      tests/test_lineage tests/test_output \
+	      tests/test_lineage_asan tests/test_output_asan
