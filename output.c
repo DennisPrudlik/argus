@@ -2,6 +2,9 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include "output.h"
+#include "lineage.h"
+
+#define LINEAGE_BUF 256
 
 static output_fmt_t g_fmt    = OUTPUT_TEXT;
 static filter_t     g_filter = {0};
@@ -51,21 +54,24 @@ void print_header(const char *backend)
     if (g_filter.pid || g_filter.comm[0] || g_filter.path[0])
         putchar('\n');
 
-    printf("\n%-5s  %-6s  %-6s  %-4s  %-4s  %-16s  %s\n",
-           "TYPE", "PID", "PPID", "UID", "GID", "COMM", "DETAIL");
-    printf("%-5s  %-6s  %-6s  %-4s  %-4s  %-16s  %s\n",
+    printf("\n%-5s  %-6s  %-6s  %-4s  %-4s  %-16s  %-32s  %s\n",
+           "TYPE", "PID", "PPID", "UID", "GID", "COMM", "LINEAGE", "DETAIL");
+    printf("%-5s  %-6s  %-6s  %-4s  %-4s  %-16s  %-32s  %s\n",
            "-----", "------", "------", "----", "----",
-           "----------------", "------");
+           "----------------", "--------------------------------", "------");
 }
 
 static void text_event(const event_t *e)
 {
-    printf("%-5s  %-6d  %-6d  %-4u  %-4u  %-16s  ",
+    char chain[LINEAGE_BUF];
+    lineage_str(e->ppid, chain, sizeof(chain));
+
+    printf("%-5s  %-6d  %-6d  %-4u  %-4u  %-16s  %-32s  ",
            e->type == EVENT_EXEC    ? "EXEC"  :
            e->type == EVENT_OPEN    ? "OPEN"  :
            e->type == EVENT_EXIT    ? "EXIT"  :
            e->type == EVENT_CONNECT ? "CONN"  : "?",
-           e->pid, e->ppid, e->uid, e->gid, e->comm);
+           e->pid, e->ppid, e->uid, e->gid, e->comm, chain);
 
     switch (e->type) {
     case EVENT_EXEC:
@@ -116,6 +122,9 @@ static void json_event(const event_t *e)
         [EVENT_CONNECT] = "CONNECT",
     };
 
+    char chain[LINEAGE_BUF];
+    lineage_str(e->ppid, chain, sizeof(chain));
+
     printf("{\"type\":\"%s\","
            "\"pid\":%d,\"ppid\":%d,"
            "\"uid\":%u,\"gid\":%u,"
@@ -124,6 +133,8 @@ static void json_event(const event_t *e)
            e->pid, e->ppid,
            e->uid, e->gid);
     json_str(e->comm);
+    printf(",\"lineage\":");
+    json_str(chain);
 
     printf(",\"duration_ns\":%llu,\"success\":%s",
            (unsigned long long)e->duration_ns,

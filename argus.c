@@ -9,6 +9,7 @@
 #include "argus.skel.h"
 #include "argus.h"
 #include "output.h"
+#include "lineage.h"
 
 static volatile int running = 1;
 static uint64_t last_drops = 0;
@@ -85,8 +86,22 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
     (void)ctx;
     (void)data_sz;
     const event_t *e = data;
+
+    /*
+     * Print before updating the tree so that:
+     *   EXEC: lineage_str walks the parent chain which is already populated
+     *   EXIT: the exiting process is still in the table when we print,
+     *         so ancestors of its children remain resolvable
+     */
     if (event_matches(e))
         print_event(e);
+
+    /* Maintain lineage cache regardless of filter (tree must stay consistent) */
+    if (e->type == EVENT_EXEC)
+        lineage_update(e->pid, e->ppid, e->comm);
+    else if (e->type == EVENT_EXIT)
+        lineage_remove(e->pid);
+
     return 0;
 }
 

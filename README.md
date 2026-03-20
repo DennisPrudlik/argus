@@ -1,208 +1,171 @@
 # Argus
 
-Argus is a small cross-platform process and file activity tracer.
+A lightweight Linux kernel telemetry tool built on eBPF. Traces process execution, file opens, network connections, and process exits system-wide with minimal overhead, with per-event process ancestry (`systemd→sshd→bash→curl`).
 
-The project uses a platform-native backend on each operating system:
+## Requirements
 
-- **Linux**: eBPF + libbpf
-- **macOS**: Endpoint Security Framework (ESF)
+- Linux kernel **5.8+** with BTF enabled (`/sys/kernel/btf/vmlinux` must exist)
+- Root or `CAP_BPF` + `CAP_PERFMON`
 
-Its goal is to provide a lightweight CLI for observing process execution, file opens, process exits, and—on Linux—outbound network connects, with either human-readable or newline-delimited JSON output.
-
-## Project Goal
-
-Argus is intended to be a simple systems-observability tool for:
-
-- watching what processes execute
-- seeing which files are opened
-- tracking process exits and exit codes
-- capturing outbound network connect attempts where supported
-- filtering events down to a specific process, command name, or path substring
-- producing output that is easy to read live or pipe into other tools
-
-## Implemented Features
-
-### Shared user-facing features
-
-- Text table output for interactive terminal use
-- Newline-delimited JSON output via `--json`
-- Event filtering by:
-  - PID via `--pid`
-  - process name via `--comm`
-  - file path substring via `--path`
-- Graceful shutdown with `Ctrl-C`
-- Unified event model in `argus.h`
-
-### Linux backend (`argus`)
-
-Implemented with eBPF tracepoints and a libbpf userspace loader.
-
-Currently captures:
-
-- `EXEC`: `execve` entry/exit, including executable path and collected argv tail
-- `OPEN`: `openat` entry/exit, including target filename and success/failure
-- `EXIT`: process exit, including exit code
-- `CONNECT`: IPv4/IPv6 outbound `connect()` activity, including destination address and port
-
-Implementation details already present:
-
-- Ring buffer delivery from kernel to userspace
-- Per-event duration tracking for `EXEC`, `OPEN`, and `CONNECT`
-- Parent PID, UID, GID, and command name capture
-- IPv4 and IPv6 destination formatting in output
-
-### macOS backend (`argus_esf`)
-
-Implemented with the Endpoint Security Framework.
-
-Currently captures:
-
-- `EXEC`: process execution notifications, including executable path and arguments
-- `OPEN`: file open notifications
-- `EXIT`: process exit notifications and exit status
-
-Current macOS limitations already documented in code:
-
-- `CONNECT` is **not** implemented through ESF
-- Network monitoring on macOS would require a separate Network Extension-based implementation
-- The ESF binary must be code-signed with the proper entitlement and run as root
-- `duration_ns` is always `0` on macOS because the current implementation uses notify events
-
-## Event Types
-
-Argus currently defines these event types in `argus.h`:
-
-- `EVENT_EXEC`
-- `EVENT_OPEN`
-- `EVENT_EXIT`
-- `EVENT_CONNECT`
-
-## Build
-
-The `Makefile` selects the backend based on `uname -s`.
-
-### macOS
-
-Build:
+### Build dependencies
 
 ```sh
+# Ubuntu / Debian
+sudo apt-get install -y clang llvm libbpf-dev libelf-dev zlib1g-dev linux-tools-common linux-tools-generic
+
+# Fedora / RHEL
+sudo dnf install -y clang llvm libbpf-devel elfutils-libelf-devel zlib-devel bpftool
+```
+
+Verify BTF is available on your kernel:
+
+```sh
+ls /sys/kernel/btf/vmlinux
+```
+
+## Install
+
+```sh
+git clone https://github.com/DennisPrudlik/argus
+cd argus
 make
 ```
 
-This builds `argus_esf`.
+The build produces a single binary: `argus`.
 
-After building, the binary must be signed before use:
-
-```sh
-codesign --entitlements argus.entitlements -s "Developer ID" argus_esf
-```
-
-### Linux
-
-Build:
-
-```sh
-make
-```
-
-This builds:
-
-- `vmlinux.h` from kernel BTF
-- `argus.bpf.o`
-- `argus.skel.h`
-- `argus`
-
-Linux build dependencies implied by the source and `Makefile` include:
-
-- `clang`
-- `bpftool`
-- `libbpf`
-- `libelf`
-- `zlib`
-- kernel BTF available at `/sys/kernel/btf/vmlinux`
+Build steps performed by `make`:
+1. Generates `vmlinux.h` from the running kernel's BTF via `bpftool`
+2. Compiles `argus.bpf.c` to a BPF ELF object with `clang`
+3. Generates `argus.skel.h` (libbpf skeleton) via `bpftool`
+4. Compiles the userspace loader `argus` with `gcc`
 
 ## Usage
 
-### Linux
+```sh
+sudo ./argus [OPTIONS]
+```
+
+| Option | Description |
+|---|---|
+| `--pid <pid>` | Only show events from this PID (enforced in kernel) |
+| `--comm <name>` | Only show events from processes with this name (enforced in kernel) |
+| `--path <str>` | Only show file events whose path contains this string (userspace) |
+| `--json` | Emit newline-delimited JSON instead of a text table |
+| `--help` | Show usage |
+
+### Examples
 
 ```sh
+# Trace everything
 sudo ./argus
-sudo ./argus --json
-sudo ./argus --pid 1234
+
+# Watch only curl activity
 sudo ./argus --comm curl
-sudo ./argus --path /etc/
+
+# Watch a specific PID
+sudo ./argus --pid 1234
+
+# Watch file opens under /etc
+sudo ./argus --path /etc
+
+# JSON output, pipe into jq
+sudo ./argus --json | jq 'select(.type == "EXEC")'
+
+# Filter by comm, JSON output
+sudo ./argus --comm nginx --json
 ```
 
-### macOS
+## Output
+
+### Text
+
+```
+Tracing via eBPF (EXEC, OPEN, EXIT, CONNECT)... Ctrl-C to stop.
+
+TYPE   PID     PPID    UID   GID   COMM              LINEAGE                           DETAIL
+-----  ------  ------  ----  ----  ----------------  --------------------------------  ------
+EXEC   3821    3820    1000  1000  curl              systemd→sshd→bash                 /usr/bin/curl example.com
+OPEN   3821    3820    1000  1000  curl              systemd→sshd→bash                 [OK] /etc/ssl/certs/ca-certificates.crt
+CONN   3821    3820    1000  1000  curl              systemd→sshd→bash                 [OK] 93.184.216.34:443
+EXIT   3821    3820    1000  1000  curl              systemd→sshd→bash                 exit_code=0
+```
+
+### JSON (`--json`)
+
+One object per line, suitable for `jq`, log shippers, or SIEMs:
+
+```json
+{"type":"EXEC","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"comm":"curl","lineage":"systemd→sshd→bash","duration_ns":41238,"success":true,"filename":"/usr/bin/curl","args":"example.com"}
+{"type":"OPEN","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"comm":"curl","lineage":"systemd→sshd→bash","duration_ns":9812,"success":true,"filename":"/etc/ssl/certs/ca-certificates.crt"}
+{"type":"CONNECT","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"comm":"curl","lineage":"systemd→sshd→bash","duration_ns":2301,"success":true,"family":2,"daddr":"93.184.216.34","dport":443}
+{"type":"EXIT","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"comm":"curl","lineage":"systemd→sshd→bash","duration_ns":0,"success":true,"exit_code":0}
+```
+
+If the ring buffer fills under load, a drop warning is emitted:
+
+```
+[WARNING: 14 event(s) dropped — ring buffer full]
+```
+
+In `--json` mode this appears inline as `{"type":"DROP","count":14}`.
+
+## Event Types
+
+| Type | Tracepoint | Fields |
+|---|---|---|
+| `EXEC` | `syscalls/sys_{enter,exit}_execve` | `filename`, `args`, `duration_ns` |
+| `OPEN` | `syscalls/sys_{enter,exit}_openat` | `filename`, `success`, `duration_ns` |
+| `EXIT` | `sched/sched_process_exit` | `exit_code` |
+| `CONNECT` | `syscalls/sys_{enter,exit}_connect` | `family`, `daddr`, `dport`, `success`, `duration_ns` |
+
+All events include: `pid`, `ppid`, `uid`, `gid`, `comm`, `lineage`.
+
+## Kernel-side filtering
+
+`--pid` and `--comm` filters are pushed into BPF maps before any programs attach. The kernel drops non-matching events before they reach the ring buffer — filtered runs have near-zero overhead even on noisy hosts. `--path` is evaluated in userspace after delivery.
+
+## Process lineage
+
+Argus maintains a userspace process ancestry cache updated on every `EXEC` and `EXIT`. The `lineage` field shows the ancestor chain from the oldest known ancestor down to the immediate parent (e.g. `systemd→sshd→bash`). Processes that were already running when argus started show `?` until they exec again — this is a cold-start limitation of the tracepoint approach.
+
+## Development environment
+
+If you are on macOS or a machine without a compatible Linux kernel, use the included Lima VM config to get a full Ubuntu 22.04 environment with all dependencies pre-installed:
 
 ```sh
-sudo ./argus_esf
-sudo ./argus_esf --json
-sudo ./argus_esf --pid 1234
-sudo ./argus_esf --comm Finder
-sudo ./argus_esf --path /Applications/
+# Install Lima (macOS)
+brew install lima
+
+# Start the VM (first run downloads Ubuntu 22.04, ~5 min)
+limactl start --name=argus lima/argus.yaml
+
+# Open a shell inside the VM
+limactl shell argus
+
+# Build and run (your working directory is auto-mounted)
+cd ~/path/to/argus
+make
+sudo ./argus
 ```
 
-## Output Modes
+The Lima VM uses Apple's Virtualization Framework (`vmType: vz`) on Apple Silicon for near-native performance. Your macOS home directory is mounted read-write inside the VM at the same path, so edits in VS Code are immediately visible inside the VM.
 
-### Text output
+To connect VS Code directly to the VM via Remote SSH, add the Lima SSH config:
 
-The default text output prints a compact table with:
+```sh
+limactl show-ssh --format config argus >> ~/.ssh/config
+# Then connect to host "lima-argus" in VS Code Remote SSH
+```
 
-- event type
-- PID / PPID
-- UID / GID
-- command name
-- event-specific details
+## Repository layout
 
-### JSON output
-
-`--json` emits one JSON object per line, suitable for piping into tools like `jq` or log collectors.
-
-## Repository Layout
-
-- `argus.bpf.c`: Linux eBPF programs
-- `argus.c`: Linux userspace loader and CLI
-- `argus_esf.c`: macOS Endpoint Security backend and CLI
-- `output.c` / `output.h`: shared filtering and output formatting
-- `argus.h`: shared event definitions
-- `argus.entitlements`: macOS Endpoint Security entitlement file
-- `Makefile`: platform-aware build entry point
-
-## Current Status
-
-What is already implemented today:
-
-- cross-platform CLI structure
-- shared event schema
-- Linux eBPF tracing backend
-- macOS ESF tracing backend
-- text and JSON output modes
-- runtime filtering for PID, command name, and path
-
-What is not yet implemented:
-
-- macOS network connect monitoring
-- packaging/install workflow
-- persisted logging or remote export
-- tests and benchmark coverage
-
-## Next Implementation Step
-
-The immediate focus is the **Linux backend first**.
-
-Recommended direction:
-
-- harden the Linux tracer with validation on real workloads and edge cases
-- expand Linux event coverage before chasing platform parity
-- keep the shared event model in `argus.h` stable while the Linux feature set matures
-- continue using the shared filtering and output pipeline in `output.c`
-
-## Linux-First Roadmap
-
-- **Step 1**: Strengthen the Linux `eBPF` path with test coverage and sample validation for `EXEC`, `OPEN`, `EXIT`, and `CONNECT`
-- **Step 2**: Add more Linux activity types such as `accept`, `bind`, `listen`, `rename`, or `unlink` where they fit the current event model
-- **Step 3**: Improve Linux usability with packaging, clearer dependency checks, and better setup guidance for `libbpf` / `bpftool`
-- **Step 4**: After the Linux backend is stable, bring macOS closer to parity with a separate network-monitoring implementation
-
-This keeps Argus focused on building a strong Linux tracer first, then using that baseline to guide parity work on macOS.
+```
+argus.bpf.c     eBPF kernel programs (execve, openat, connect, sched_process_exit)
+argus.c         Userspace loader, ring buffer consumer, CLI
+output.c/h      Text and JSON formatting, event filtering
+lineage.c/h     Userspace process ancestry cache
+argus.h         Shared event struct and type definitions
+lima/           Lima VM config for development on non-Linux hosts
+.devcontainer/  VS Code Dev Container config (alternative to Lima)
+Makefile        Build entry point
+```

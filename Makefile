@@ -2,28 +2,6 @@ CLANG   ?= clang
 CC      ?= gcc
 BPFTOOL ?= bpftool
 
-OS := $(shell uname -s)
-
-ifeq ($(OS),Darwin)
-# ── macOS: Endpoint Security Framework ───────────────────────────────────────
-CFLAGS := -g -Wall -I.
-
-.PHONY: all clean
-
-all: argus_esf
-
-argus_esf: argus_esf.c output.c output.h argus.h
-	$(CLANG) $(CFLAGS) -o $@ argus_esf.c output.c \
-		-framework EndpointSecurity -lbsm
-	@echo ""
-	@echo "NOTE: sign the binary before running:"
-	@echo "  codesign --entitlements argus.entitlements -s 'Developer ID' argus_esf"
-
-clean:
-	rm -f argus_esf
-
-else
-# ── Linux: eBPF + libbpf ─────────────────────────────────────────────────────
 ARCH := $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
 
 BPF_CFLAGS := -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) \
@@ -47,10 +25,8 @@ argus.skel.h: argus.bpf.o
 	$(BPFTOOL) gen skeleton $< > $@
 
 # 4. Compile the userspace loader
-argus: argus.c output.c output.h argus.skel.h argus.h
-	$(CC) $(CFLAGS) -o $@ argus.c output.c -lbpf -lelf -lz
+argus: argus.c output.c lineage.c output.h lineage.h argus.skel.h argus.h
+	$(CC) $(CFLAGS) -o $@ argus.c output.c lineage.c -lbpf -lelf -lz
 
 clean:
 	rm -f argus argus.bpf.o argus.skel.h vmlinux.h
-
-endif
