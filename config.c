@@ -13,6 +13,15 @@ void cfg_defaults(argus_cfg_t *cfg)
     cfg->filter.event_mask  = TRACE_ALL;
     cfg->ring_buffer_kb     = 256;
     cfg->summary_interval   = 0;
+
+    /*
+     * Suppress high-frequency kernel pseudo-filesystem noise by default.
+     * A config file with "exclude_paths": [] clears these.
+     */
+    strncpy(cfg->filter.excludes[0], "/proc", 127);
+    strncpy(cfg->filter.excludes[1], "/sys",  127);
+    strncpy(cfg->filter.excludes[2], "/dev",  127);
+    cfg->filter.exclude_count = 3;
 }
 
 /* ── minimal JSON parser ────────────────────────────────────────────────── */
@@ -159,8 +168,11 @@ int cfg_load(const char *path, argus_cfg_t *cfg)
             p = parse_int(p, &cfg->summary_interval);
         else if (strcmp(key, "event_types") == 0)
             parse_event_types(p, &cfg->filter.event_mask);
-        else if (strcmp(key, "exclude_paths") == 0)
+        else if (strcmp(key, "exclude_paths") == 0) {
+            /* Reset first so an empty array clears the defaults */
+            cfg->filter.exclude_count = 0;
             parse_exclude_paths(p, &cfg->filter);
+        }
 
         /* advance past current value to next key */
         while (*p && *p != ',' && *p != '}') p++;

@@ -1,6 +1,9 @@
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <dirent.h>
 #include "lineage.h"
 
 /* ── process table ──────────────────────────────────────────────────────── */
@@ -66,6 +69,51 @@ void lineage_remove(uint32_t pid)
     slot_t *s = lookup(pid);
     if (s)
         s->pid = PID_DEAD;
+}
+
+/* ── lineage_scan_proc ──────────────────────────────────────────────────── */
+
+void lineage_scan_proc(void)
+{
+    DIR *d = opendir("/proc");
+    if (!d)
+        return;
+
+    struct dirent *ent;
+    while ((ent = readdir(d))) {
+        /* only numeric entries are PIDs */
+        const char *np = ent->d_name;
+        while (*np >= '0' && *np <= '9') np++;
+        if (*np || np == ent->d_name)
+            continue;
+
+        char path[280];   /* "/proc/" + NAME_MAX(255) + "/status" + NUL */
+        snprintf(path, sizeof(path), "/proc/%s/status", ent->d_name);
+        FILE *f = fopen(path, "r");
+        if (!f)
+            continue;
+
+        uint32_t pid  = (uint32_t)atoi(ent->d_name);
+        uint32_t ppid = 0;
+        char     comm[16] = {};
+        char     line[256];
+
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, "Name:\t", 6) == 0) {
+                strncpy(comm, line + 6, sizeof(comm) - 1);
+                char *nl = strchr(comm, '\n');
+                if (nl) *nl = '\0';
+            } else if (strncmp(line, "PPid:\t", 6) == 0) {
+                ppid = (uint32_t)atoi(line + 6);
+            }
+        }
+        fclose(f);
+
+        if (pid && comm[0])
+            lineage_update(pid, ppid, comm);
+    }
+
+    closedir(d);
 }
 
 /* ── lineage_str ────────────────────────────────────────────────────────── */

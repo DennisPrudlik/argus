@@ -75,10 +75,11 @@ echo "Test 1: --pid filter"
 MY_PID=$$
 start_argus --pid "$MY_PID"
 
-# Generate exec from our own PID
-bash -c "ls /tmp >/dev/null 2>&1"
+# Generate OPEN event from our own PID using shell file-descriptor (no subprocess)
+exec 3</etc/hostname
+exec 3<&-
 
-# Generate exec from a different PID (background subshell)
+# Generate events from a different PID (background subshell) to verify filtering
 OTHER_OUT=$(mktemp)
 bash -c "sleep 0.05; ls /tmp >/dev/null 2>&1" &
 OTHER_PID=$!

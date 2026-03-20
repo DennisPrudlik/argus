@@ -1,0 +1,26 @@
+[Unit]
+Description=Argus kernel telemetry daemon
+Documentation=https://github.com/DennisPrudlik/argus
+After=sysinit.target
+Wants=sysinit.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/argus --json
+StandardOutput=append:/var/log/argus/events.jsonl
+StandardError=journal
+Restart=on-failure
+RestartSec=5s
+
+# Create /var/log/argus/ automatically
+LogsDirectory=argus
+LogsDirectoryMode=0750
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/log/argus
+
+[Install]
+WantedBy=multi-user.target

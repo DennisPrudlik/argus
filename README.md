@@ -39,6 +39,24 @@ Build steps performed by `make`:
 3. Generates `argus.skel.h` (libbpf skeleton) via `bpftool`
 4. Compiles the userspace loader `argus` with `gcc`
 
+### System-wide install
+
+```sh
+sudo make install      # installs to /usr/local/bin/argus + /etc/systemd/system/argus.service
+sudo make uninstall    # removes both
+```
+
+To run as a persistent daemon:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now argus
+journalctl -u argus -f       # live log
+cat /var/log/argus/events.jsonl  # persistent JSONL output
+```
+
+The service writes JSON to `/var/log/argus/events.jsonl`, drops privileges to `nobody` after attach, and restarts automatically on failure.
+
 ## Usage
 
 ```sh
@@ -56,6 +74,8 @@ sudo ./argus [OPTIONS]
 | `--ringbuf <kb>` | Ring buffer size in KB (default: 256) |
 | `--summary <secs>` | Rolling summary every N seconds instead of per-event output |
 | `--json` | Emit newline-delimited JSON instead of a text table |
+| `--no-drop-privs` | Stay root after attach (not recommended) |
+| `--version` | Print version and exit |
 | `--help` | Show usage |
 
 ### Examples
@@ -147,7 +167,7 @@ Instead of per-event lines, print a rolling summary every N seconds:
 
 ## Config file
 
-Argus loads `~/.config/argus/config.json` then `/etc/argus/config.json` on startup (if present). CLI flags always override file values. All keys are optional.
+Argus loads `/etc/argus/config.json` then `~/.config/argus/config.json` on startup (if present), with later values overriding earlier ones. CLI flags always take final precedence. All keys are optional.
 
 ```json
 {
@@ -167,9 +187,15 @@ A config file is the recommended way to run argus as a persistent daemon — set
 
 `--pid` and `--comm` filters are pushed into BPF maps before any programs attach. The kernel drops non-matching events before they reach the ring buffer — filtered runs have near-zero overhead even on noisy hosts. `--path` and `--exclude` are evaluated in userspace after delivery. `--events` prevents the unused BPF programs from loading entirely.
 
+## Security
+
+After all BPF programs are attached and the ring buffer file descriptor is open, argus drops from root to `nobody` (uid 65534) so the event loop runs with minimal privilege. All open file descriptors remain valid after the privilege drop.
+
+To keep root throughout (e.g. for debugging), pass `--no-drop-privs`.
+
 ## Process lineage
 
-Argus maintains a userspace process ancestry cache updated on every `EXEC` and `EXIT`. The `lineage` field shows the ancestor chain from the oldest known ancestor down to the immediate parent (e.g. `systemd→sshd→bash`). Processes that were already running when argus started show `?` until they exec again — this is a cold-start limitation of the tracepoint approach.
+At startup, argus scans `/proc` to pre-populate the ancestry cache with all currently running processes before any BPF programs attach. This eliminates the cold-start gap where pre-existing processes would show `?` for their lineage. The `lineage` field shows the ancestor chain from the oldest known ancestor down to the immediate parent (e.g. `systemd→sshd→bash`).
 
 ## Development environment
 
@@ -212,17 +238,23 @@ make test-integration
 
 Unit tests cover `event_matches` filter logic (pid, comm, path, excludes, event mask) and the lineage cache (chain building, tombstone deletion, buffer truncation). Integration tests start argus with `--pid`, `--comm`, `--events`, and `--exclude` filters against live kernel events and verify only matching events appear in the output.
 
+## CI
+
+Every push and pull request to `main` runs the full test suite on GitHub Actions (`ubuntu-latest`). The workflow installs all build dependencies, verifies BTF availability, builds the binary, and runs both unit and integration tests.
+
 ## Repository layout
 
 ```
-argus.bpf.c     eBPF kernel programs (execve, openat, connect, sched_process_exit)
-argus.c         Userspace loader, ring buffer consumer, CLI
-output.c/h      Text and JSON formatting, filtering, summary mode
-lineage.c/h     Userspace process ancestry cache
-config.c/h      JSON config file parser
-argus.h         Shared event struct, type definitions, TRACE_* bitmasks
-tests/          Unit tests (test_lineage.c, test_output.c) and integration test (test_filter.sh)
-lima/           Lima VM config for development on non-Linux hosts
-.devcontainer/  VS Code Dev Container config (alternative to Lima)
-Makefile        Build entry point (targets: all, test, test-integration, clean)
+argus.bpf.c          eBPF kernel programs (execve, openat, connect, sched_process_exit)
+argus.c              Userspace loader, ring buffer consumer, CLI
+output.c/h           Text and JSON formatting, filtering, summary mode
+lineage.c/h          Userspace process ancestry cache
+config.c/h           JSON config file parser
+argus.h              Shared event struct, type definitions, TRACE_* bitmasks
+argus.service        systemd service unit
+tests/               Unit tests (test_lineage.c, test_output.c) and integration test (test_filter.sh)
+lima/                Lima VM config for development on non-Linux hosts
+.devcontainer/       VS Code Dev Container config (alternative to Lima)
+.github/workflows/   GitHub Actions CI
+Makefile             Build entry point (targets: all, test, test-integration, install, clean)
 ```

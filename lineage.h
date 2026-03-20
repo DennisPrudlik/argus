@@ -15,6 +15,13 @@
  * as much of the chain as it can and stops when a parent isn't found.
  */
 
+/*
+ * Walk /proc at startup and pre-populate the cache with every running process.
+ * Fixes the cold-start problem where all lineage shows "?" until processes
+ * re-exec. Safe to call before the BPF programs attach.
+ */
+void lineage_scan_proc(void);
+
 /* Register a new process (call on EVENT_EXEC, before printing the event) */
 void lineage_update(uint32_t pid, uint32_t ppid, const char *comm);
 

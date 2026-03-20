@@ -1,6 +1,8 @@
 #ifndef __ARGUS_H
 #define __ARGUS_H
 
+#define ARGUS_VERSION "0.1.0"
+
 /* vmlinux.h (BPF context) already provides these types */
 #ifndef __VMLINUX_H__
 #include <stdint.h>

@@ -4,6 +4,9 @@
 #include <signal.h>
 #include <errno.h>
 #include <getopt.h>
+#include <pwd.h>
+#include <grp.h>
+#include <unistd.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "argus.skel.h"
@@ -12,23 +15,51 @@
 #include "lineage.h"
 #include "config.h"
 
-static volatile int running = 1;
+static volatile int running    = 1;
 static uint64_t     last_drops = 0;
 
-static void check_drops(int map_fd)
+static void sig_handler(int sig) { (void)sig; running = 0; }
+
+/* ── drop accounting ────────────────────────────────────────────────────── */
+
+static uint64_t read_drop_delta(int map_fd)
 {
     uint32_t key   = 0;
     uint64_t drops = 0;
     if (bpf_map_lookup_elem(map_fd, &key, &drops))
-        return;
+        return 0;
     uint64_t delta = drops > last_drops ? drops - last_drops : 0;
-    if (delta) {
+    if (delta)
         last_drops = drops;
-        print_drops(delta);
+    return delta;
+}
+
+/* ── privilege drop ─────────────────────────────────────────────────────── */
+/*
+ * Called after all BPF programs are attached and the ring buffer fd is open.
+ * Drops from root to 'nobody' (uid 65534) so the event loop runs with
+ * minimal privilege. All open file descriptors remain valid after setuid.
+ */
+static void drop_privileges(void)
+{
+    uid_t uid = 65534;
+    gid_t gid = 65534;
+
+    struct passwd *pw = getpwnam("nobody");
+    if (pw) {
+        uid = pw->pw_uid;
+        gid = pw->pw_gid;
+    }
+
+    if (setgroups(0, NULL) < 0 ||
+        setgid(gid)         < 0 ||
+        setuid(uid)         < 0) {
+        perror("warning: could not drop privileges");
+        /* non-fatal — continue as root rather than abort */
     }
 }
 
-static void sig_handler(int sig) { (void)sig; running = 0; }
+/* ── CLI helpers ────────────────────────────────────────────────────────── */
 
 static void usage(const char *prog)
 {
@@ -36,26 +67,27 @@ static void usage(const char *prog)
         "Usage: %s [OPTIONS]\n"
         "\n"
         "Options:\n"
-        "  --config  <path>  Config file (default: /etc/argus/config.json)\n"
-        "  --pid     <pid>   Only trace this PID (kernel-enforced)\n"
-        "  --comm    <name>  Only trace this process name (kernel-enforced)\n"
-        "  --path    <str>   Only show file events whose path contains <str>\n"
-        "  --exclude <pfx>   Exclude OPEN events whose path starts with <pfx>\n"
-        "  --events  <list>  Comma-separated event types: EXEC,OPEN,EXIT,CONNECT\n"
-        "  --ringbuf <kb>    Ring buffer size in KB (default: 256)\n"
-        "  --summary <secs>  Rolling summary every N seconds instead of per-event\n"
-        "  --json            Newline-delimited JSON output\n"
-        "  --help            Show this message\n",
+        "  --config      <path>  Config file (default: ~/.config/argus/config.json)\n"
+        "  --pid         <pid>   Only trace this PID (kernel-enforced)\n"
+        "  --comm        <name>  Only trace this process name (kernel-enforced)\n"
+        "  --path        <str>   Only show events whose path contains <str>\n"
+        "  --exclude     <pfx>   Exclude OPEN events whose path starts with <pfx>\n"
+        "  --events      <list>  Comma-separated types: EXEC,OPEN,EXIT,CONNECT\n"
+        "  --ringbuf     <kb>    Ring buffer size in KB (default: 256)\n"
+        "  --summary     <secs>  Rolling summary every N seconds\n"
+        "  --no-drop-privs       Stay root after attach (not recommended)\n"
+        "  --json                Newline-delimited JSON output\n"
+        "  --version             Print version and exit\n"
+        "  --help                Show this message\n",
         prog);
 }
 
-/* Parse "EXEC,OPEN,EXIT,CONNECT" into a TRACE_* bitmask */
 static int parse_event_list(const char *s)
 {
     int mask = 0;
     char buf[64];
     strncpy(buf, s, sizeof(buf) - 1);
-    buf[sizeof(buf)-1] = '\0';
+    buf[sizeof(buf) - 1] = '\0';
     char *tok = strtok(buf, ",");
     while (tok) {
         while (*tok == ' ') tok++;
@@ -67,6 +99,8 @@ static int parse_event_list(const char *s)
     }
     return mask;
 }
+
+/* ── BPF setup ──────────────────────────────────────────────────────────── */
 
 static void setup_bpf_filters(struct argus_bpf *skel, const filter_t *f)
 {
@@ -93,7 +127,6 @@ static void setup_bpf_filters(struct argus_bpf *skel, const filter_t *f)
                             &zero, &cfg, BPF_ANY);
 }
 
-/* Selectively detach BPF programs for event types not in event_mask */
 static void configure_programs(struct argus_bpf *skel, int event_mask)
 {
     if (!(event_mask & TRACE_EXEC)) {
@@ -112,6 +145,8 @@ static void configure_programs(struct argus_bpf *skel, int event_mask)
     }
 }
 
+/* ── event handler ──────────────────────────────────────────────────────── */
+
 static int handle_event(void *ctx, void *data, size_t data_sz)
 {
     (void)ctx; (void)data_sz;
@@ -120,6 +155,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
     if (event_matches(e))
         print_event(e);
 
+    /* Update lineage regardless of filter so the tree stays consistent */
     if (e->type == EVENT_EXEC)
         lineage_update(e->pid, e->ppid, e->comm);
     else if (e->type == EVENT_EXIT)
@@ -128,15 +164,17 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
     return 0;
 }
 
+/* ── main ───────────────────────────────────────────────────────────────── */
+
 int main(int argc, char **argv)
 {
-    argus_cfg_t   cfg;
-    output_fmt_t  fmt     = OUTPUT_TEXT;
-    const char   *cfgpath = NULL;
+    argus_cfg_t  cfg;
+    output_fmt_t fmt          = OUTPUT_TEXT;
+    int          no_drop_privs = 0;
 
     cfg_defaults(&cfg);
 
-    /* Try default config locations before parsing CLI */
+    /* Load config files — CLI flags override below */
     if (cfg_load("/etc/argus/config.json", &cfg) == -2)
         fprintf(stderr, "warning: error reading /etc/argus/config.json\n");
     {
@@ -150,46 +188,48 @@ int main(int argc, char **argv)
     }
 
     static const struct option long_opts[] = {
-        {"config",  required_argument, 0, 'C'},
-        {"pid",     required_argument, 0, 'p'},
-        {"comm",    required_argument, 0, 'c'},
-        {"path",    required_argument, 0, 'P'},
-        {"exclude", required_argument, 0, 'x'},
-        {"events",  required_argument, 0, 'e'},
-        {"ringbuf", required_argument, 0, 'r'},
-        {"summary", required_argument, 0, 's'},
-        {"json",    no_argument,       0, 'j'},
-        {"help",    no_argument,       0, 'h'},
+        {"config",        required_argument, 0, 'C'},
+        {"pid",           required_argument, 0, 'p'},
+        {"comm",          required_argument, 0, 'c'},
+        {"path",          required_argument, 0, 'P'},
+        {"exclude",       required_argument, 0, 'x'},
+        {"events",        required_argument, 0, 'e'},
+        {"ringbuf",       required_argument, 0, 'r'},
+        {"summary",       required_argument, 0, 's'},
+        {"no-drop-privs", no_argument,       0, 'n'},
+        {"json",          no_argument,       0, 'j'},
+        {"version",       no_argument,       0, 'V'},
+        {"help",          no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "C:p:c:P:x:e:r:s:jh",
+    while ((opt = getopt_long(argc, argv, "C:p:c:P:x:e:r:s:njVh",
                               long_opts, NULL)) != -1) {
         switch (opt) {
         case 'C':
-            cfgpath = optarg;
-            if (cfg_load(cfgpath, &cfg) != 0)
-                fprintf(stderr, "warning: could not load %s\n", cfgpath);
+            if (cfg_load(optarg, &cfg) != 0)
+                fprintf(stderr, "warning: could not load %s\n", optarg);
             break;
-        case 'p': cfg.filter.pid = atoi(optarg);                                   break;
-        case 'c': strncpy(cfg.filter.comm, optarg, sizeof(cfg.filter.comm) - 1);   break;
-        case 'P': strncpy(cfg.filter.path, optarg, sizeof(cfg.filter.path) - 1);   break;
+        case 'p': cfg.filter.pid = atoi(optarg);                                  break;
+        case 'c': strncpy(cfg.filter.comm, optarg, sizeof(cfg.filter.comm)-1);    break;
+        case 'P': strncpy(cfg.filter.path, optarg, sizeof(cfg.filter.path)-1);    break;
         case 'x':
             if (cfg.filter.exclude_count < 8)
                 strncpy(cfg.filter.excludes[cfg.filter.exclude_count++],
                         optarg, 127);
             break;
-        case 'e': cfg.filter.event_mask = parse_event_list(optarg);                break;
-        case 'r': cfg.ring_buffer_kb    = atoi(optarg);                            break;
-        case 's': cfg.summary_interval  = atoi(optarg);                            break;
-        case 'j': fmt = OUTPUT_JSON;                                                break;
+        case 'e': cfg.filter.event_mask = parse_event_list(optarg);               break;
+        case 'r': cfg.ring_buffer_kb    = atoi(optarg);                           break;
+        case 's': cfg.summary_interval  = atoi(optarg);                           break;
+        case 'n': no_drop_privs         = 1;                                      break;
+        case 'j': fmt                   = OUTPUT_JSON;                             break;
+        case 'V': printf("argus %s\n", ARGUS_VERSION); return 0;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 1;
         }
     }
 
-    /* 0 event_mask means "all" — normalise now so configure_programs works */
     if (cfg.filter.event_mask == 0)
         cfg.filter.event_mask = TRACE_ALL;
 
@@ -197,13 +237,18 @@ int main(int argc, char **argv)
     if (cfg.summary_interval > 0)
         output_set_summary(cfg.summary_interval);
 
-    struct argus_bpf *skel = NULL;
-    struct ring_buffer *rb = NULL;
-    int err;
-
+    /* Ignore SIGPIPE so piped consumers (jq, etc.) can exit without crashing us */
+    signal(SIGPIPE, SIG_IGN);
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
     libbpf_set_print(NULL);
+
+    /* Pre-populate lineage cache from /proc before attaching BPF programs */
+    lineage_scan_proc();
+
+    struct argus_bpf *skel = NULL;
+    struct ring_buffer *rb = NULL;
+    int err;
 
     skel = argus_bpf__open();
     if (!skel) {
@@ -211,11 +256,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Configure ring buffer size before load */
     bpf_map__set_max_entries(skel->maps.rb,
                              (uint32_t)cfg.ring_buffer_kb * 1024);
-
-    /* Disable programs for event types not requested */
     configure_programs(skel, cfg.filter.event_mask);
 
     err = argus_bpf__load(skel);
@@ -239,6 +281,10 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
+    /* Drop root privileges — all BPF fds are already open */
+    if (!no_drop_privs)
+        drop_privileges();
+
     print_header("eBPF");
 
     int drop_fd = bpf_map__fd(skel->maps.dropped);
@@ -250,16 +296,16 @@ int main(int argc, char **argv)
             fprintf(stderr, "error: ring buffer poll failed: %d\n", err);
             break;
         }
-        uint64_t drops = 0, key = 0;
-        bpf_map_lookup_elem(drop_fd, &key, &drops);
-        uint64_t delta = drops > last_drops ? drops - last_drops : 0;
-        if (delta) last_drops = drops;
+        uint64_t delta = read_drop_delta(drop_fd);
         output_summary_tick(delta);
         if (delta && !cfg.summary_interval)
             print_drops(delta);
     }
 
-    check_drops(drop_fd);
+    /* Final drop check before exit */
+    uint64_t delta = read_drop_delta(drop_fd);
+    if (delta)
+        print_drops(delta);
 
     ring_buffer__free(rb);
 cleanup:

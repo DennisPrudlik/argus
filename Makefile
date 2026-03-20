@@ -8,7 +8,11 @@ BPF_CFLAGS := -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) \
               -I/usr/include/$(shell uname -m)-linux-gnu
 CFLAGS     := -g -Wall -I.
 
-.PHONY: all clean test test-unit test-integration
+PREFIX  ?= /usr/local
+BINDIR   = $(DESTDIR)$(PREFIX)/bin
+UNITDIR  = $(DESTDIR)/etc/systemd/system
+
+.PHONY: all clean test test-unit test-integration install uninstall
 
 all: argus
 
@@ -48,6 +52,14 @@ test-integration: argus
 
 # Run unit tests only (no root required)
 test: test-unit
+
+install: argus
+	install -Dm755 argus          $(BINDIR)/argus
+	install -Dm644 argus.service  $(UNITDIR)/argus.service
+	@echo "Run: systemctl daemon-reload && systemctl enable --now argus"
+
+uninstall:
+	rm -f $(BINDIR)/argus $(UNITDIR)/argus.service
 
 clean:
 	rm -f argus argus.bpf.o argus.skel.h vmlinux.h \
