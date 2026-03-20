@@ -15,10 +15,12 @@
 #include "lineage.h"
 #include "config.h"
 
-static volatile int running    = 1;
-static uint64_t     last_drops = 0;
+static volatile int running       = 1;
+static volatile int reload_config = 0;
+static uint64_t     last_drops    = 0;
 
-static void sig_handler(int sig) { (void)sig; running = 0; }
+static void sig_handler(int sig)  { (void)sig; running = 0; }
+static void sighup_handler(int sig) { (void)sig; reload_config = 1; }
 
 /* ── drop accounting ────────────────────────────────────────────────────── */
 
@@ -72,9 +74,11 @@ static void usage(const char *prog)
         "  --comm        <name>  Only trace this process name (kernel-enforced)\n"
         "  --path        <str>   Only show events whose path contains <str>\n"
         "  --exclude     <pfx>   Exclude OPEN events whose path starts with <pfx>\n"
-        "  --events      <list>  Comma-separated types: EXEC,OPEN,EXIT,CONNECT\n"
+        "  --events      <list>  Comma-separated types: EXEC,OPEN,EXIT,CONNECT,\n"
+        "                         UNLINK,RENAME,CHMOD,BIND,PTRACE\n"
         "  --ringbuf     <kb>    Ring buffer size in KB (default: 256)\n"
         "  --summary     <secs>  Rolling summary every N seconds\n"
+        "  --rate-limit  <n>    Drop events after N per second per comm (0=off)\n"
         "  --no-drop-privs       Stay root after attach (not recommended)\n"
         "  --json                Newline-delimited JSON output\n"
         "  --config-check        Validate config file(s) and print active settings, then exit\n"
@@ -96,6 +100,11 @@ static int parse_event_list(const char *s)
         else if (strcmp(tok, "OPEN")    == 0) mask |= TRACE_OPEN;
         else if (strcmp(tok, "EXIT")    == 0) mask |= TRACE_EXIT;
         else if (strcmp(tok, "CONNECT") == 0) mask |= TRACE_CONNECT;
+        else if (strcmp(tok, "UNLINK")  == 0) mask |= TRACE_UNLINK;
+        else if (strcmp(tok, "RENAME")  == 0) mask |= TRACE_RENAME;
+        else if (strcmp(tok, "CHMOD")   == 0) mask |= TRACE_CHMOD;
+        else if (strcmp(tok, "BIND")    == 0) mask |= TRACE_BIND;
+        else if (strcmp(tok, "PTRACE")  == 0) mask |= TRACE_PTRACE;
         tok = strtok(NULL, ",");
     }
     return mask;
@@ -103,7 +112,8 @@ static int parse_event_list(const char *s)
 
 /* ── BPF setup ──────────────────────────────────────────────────────────── */
 
-static void setup_bpf_filters(struct argus_bpf *skel, const filter_t *f)
+static void setup_bpf_filters(struct argus_bpf *skel, const filter_t *f,
+                               uint32_t rate_limit_per_comm)
 {
     argus_config_t cfg = {};
     uint32_t zero = 0;
@@ -123,26 +133,47 @@ static void setup_bpf_filters(struct argus_bpf *skel, const filter_t *f)
                             key, &val, BPF_ANY);
         cfg.filter_comm_active = 1;
     }
-    if (cfg.filter_pid_active || cfg.filter_comm_active)
-        bpf_map_update_elem(bpf_map__fd(skel->maps.config_map),
-                            &zero, &cfg, BPF_ANY);
+    cfg.rate_limit_per_comm = rate_limit_per_comm;
+    /* always write config_map — even with no filters, rate_limit may be set */
+    bpf_map_update_elem(bpf_map__fd(skel->maps.config_map),
+                        &zero, &cfg, BPF_ANY);
 }
 
 static void configure_programs(struct argus_bpf *skel, int event_mask)
 {
     if (!(event_mask & TRACE_EXEC)) {
-        bpf_program__set_autoload(skel->progs.handle_execve_enter, false);
-        bpf_program__set_autoload(skel->progs.handle_execve_exit,  false);
+        bpf_program__set_autoload(skel->progs.handle_execve_enter,  false);
+        bpf_program__set_autoload(skel->progs.handle_execve_exit,   false);
     }
     if (!(event_mask & TRACE_OPEN)) {
-        bpf_program__set_autoload(skel->progs.handle_openat_enter, false);
-        bpf_program__set_autoload(skel->progs.handle_openat_exit,  false);
+        bpf_program__set_autoload(skel->progs.handle_openat_enter,  false);
+        bpf_program__set_autoload(skel->progs.handle_openat_exit,   false);
     }
     if (!(event_mask & TRACE_EXIT))
-        bpf_program__set_autoload(skel->progs.handle_process_exit, false);
+        bpf_program__set_autoload(skel->progs.handle_process_exit,  false);
     if (!(event_mask & TRACE_CONNECT)) {
         bpf_program__set_autoload(skel->progs.handle_connect_enter, false);
         bpf_program__set_autoload(skel->progs.handle_connect_exit,  false);
+    }
+    if (!(event_mask & TRACE_UNLINK)) {
+        bpf_program__set_autoload(skel->progs.handle_unlinkat_enter, false);
+        bpf_program__set_autoload(skel->progs.handle_unlinkat_exit,  false);
+    }
+    if (!(event_mask & TRACE_RENAME)) {
+        bpf_program__set_autoload(skel->progs.handle_renameat2_enter, false);
+        bpf_program__set_autoload(skel->progs.handle_renameat2_exit,  false);
+    }
+    if (!(event_mask & TRACE_CHMOD)) {
+        bpf_program__set_autoload(skel->progs.handle_fchmodat_enter, false);
+        bpf_program__set_autoload(skel->progs.handle_fchmodat_exit,  false);
+    }
+    if (!(event_mask & TRACE_BIND)) {
+        bpf_program__set_autoload(skel->progs.handle_bind_enter, false);
+        bpf_program__set_autoload(skel->progs.handle_bind_exit,  false);
+    }
+    if (!(event_mask & TRACE_PTRACE)) {
+        bpf_program__set_autoload(skel->progs.handle_ptrace_enter, false);
+        bpf_program__set_autoload(skel->progs.handle_ptrace_exit,  false);
     }
 }
 
@@ -197,6 +228,7 @@ int main(int argc, char **argv)
         {"events",        required_argument, 0, 'e'},
         {"ringbuf",       required_argument, 0, 'r'},
         {"summary",       required_argument, 0, 's'},
+        {"rate-limit",    required_argument, 0, 'R'},
         {"no-drop-privs", no_argument,       0, 'n'},
         {"json",          no_argument,       0, 'j'},
         {"config-check",  no_argument,       0, 'K'},
@@ -207,7 +239,7 @@ int main(int argc, char **argv)
 
     int config_check = 0;
     int opt;
-    while ((opt = getopt_long(argc, argv, "C:p:c:P:x:e:r:s:njKVh",
+    while ((opt = getopt_long(argc, argv, "C:p:c:P:x:e:r:s:R:njKVh",
                               long_opts, NULL)) != -1) {
         switch (opt) {
         case 'C':
@@ -235,8 +267,9 @@ int main(int argc, char **argv)
             cfg.ring_buffer_kb = kb;
             break;
         }
-        case 's': cfg.summary_interval  = atoi(optarg);                           break;
-        case 'n': no_drop_privs         = 1;                                      break;
+        case 's': cfg.summary_interval      = atoi(optarg);                       break;
+        case 'R': cfg.rate_limit_per_comm  = (uint32_t)atoi(optarg);             break;
+        case 'n': no_drop_privs            = 1;                                   break;
         case 'j': fmt                   = OUTPUT_JSON;                             break;
         case 'K': config_check          = 1;                                       break;
         case 'V': printf("argus %s\n", ARGUS_VERSION); return 0;
@@ -246,16 +279,20 @@ int main(int argc, char **argv)
     }
 
     if (config_check) {
-        static const char *type_names[] = {"EXEC","OPEN","EXIT","CONNECT"};
+        static const char *type_names[] = {
+            "EXEC","OPEN","EXIT","CONNECT",
+            "UNLINK","RENAME","CHMOD","BIND","PTRACE"
+        };
         printf("argus %s — active configuration\n\n", ARGUS_VERSION);
-        printf("  ring_buffer_kb    : %d\n",  cfg.ring_buffer_kb);
-        printf("  summary_interval  : %d\n",  cfg.summary_interval);
-        printf("  filter.pid        : %d\n",  cfg.filter.pid);
-        printf("  filter.comm       : %s\n",  cfg.filter.comm[0] ? cfg.filter.comm : "(none)");
-        printf("  filter.path       : %s\n",  cfg.filter.path[0] ? cfg.filter.path : "(none)");
-        printf("  filter.event_mask : ");
+        printf("  ring_buffer_kb      : %d\n",  cfg.ring_buffer_kb);
+        printf("  summary_interval    : %d\n",  cfg.summary_interval);
+        printf("  rate_limit_per_comm : %u\n",  cfg.rate_limit_per_comm);
+        printf("  filter.pid          : %d\n",  cfg.filter.pid);
+        printf("  filter.comm         : %s\n",  cfg.filter.comm[0] ? cfg.filter.comm : "(none)");
+        printf("  filter.path         : %s\n",  cfg.filter.path[0] ? cfg.filter.path : "(none)");
+        printf("  filter.event_mask   : ");
         int any = 0;
-        for (int i = 0; i < 4; i++)
+        for (int i = 0; i < EVENT_TYPE_MAX; i++)
             if (cfg.filter.event_mask & (1 << i)) {
                 printf("%s%s", any ? "," : "", type_names[i]);
                 any = 1;
@@ -281,6 +318,7 @@ int main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
+    signal(SIGHUP,  sighup_handler);
     libbpf_set_print(NULL);
 
     /* Pre-populate lineage cache from /proc before attaching BPF programs */
@@ -306,7 +344,7 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    setup_bpf_filters(skel, &cfg.filter);
+    setup_bpf_filters(skel, &cfg.filter, cfg.rate_limit_per_comm);
 
     err = argus_bpf__attach(skel);
     if (err) {
@@ -329,6 +367,15 @@ int main(int argc, char **argv)
 
     int drop_fd = bpf_map__fd(skel->maps.dropped);
 
+    /* Save config file paths for SIGHUP reload */
+    char cfg_home_path[256] = {};
+    {
+        const char *home = getenv("HOME");
+        if (home)
+            snprintf(cfg_home_path, sizeof(cfg_home_path),
+                     "%s/.config/argus/config.json", home);
+    }
+
     while (running) {
         err = ring_buffer__poll(rb, 100);
         if (err == -EINTR) { err = 0; break; }
@@ -336,6 +383,25 @@ int main(int argc, char **argv)
             fprintf(stderr, "error: ring buffer poll failed: %d\n", err);
             break;
         }
+
+        /* ── SIGHUP: reload config files and update BPF filter maps ── */
+        if (reload_config) {
+            reload_config = 0;
+            argus_cfg_t new_cfg;
+            cfg_defaults(&new_cfg);
+            cfg_load("/etc/argus/config.json", &new_cfg);
+            if (cfg_home_path[0])
+                cfg_load(cfg_home_path, &new_cfg);
+            /* Update BPF maps with new filter/rate settings */
+            setup_bpf_filters(skel, &new_cfg.filter, new_cfg.rate_limit_per_comm);
+            /* Update userspace filter (path, excludes, event_mask) */
+            output_update_filter(&new_cfg.filter);
+            /* Propagate to the live cfg (keep ring_buffer_kb/summary fixed) */
+            cfg.filter              = new_cfg.filter;
+            cfg.rate_limit_per_comm = new_cfg.rate_limit_per_comm;
+            fprintf(stderr, "info: configuration reloaded (SIGHUP)\n");
+        }
+
         uint64_t delta = read_drop_delta(drop_fd);
         output_summary_tick(delta);
         if (delta && !cfg.summary_interval)

@@ -18,6 +18,12 @@ void output_init(output_fmt_t fmt, const filter_t *filter)
         g_filter = *filter;
 }
 
+void output_update_filter(const filter_t *filter)
+{
+    if (filter)
+        g_filter = *filter;
+}
+
 /* ── filtering ──────────────────────────────────────────────────────────── */
 
 int event_matches(const event_t *e)
@@ -40,8 +46,10 @@ int event_matches(const event_t *e)
         strstr(e->filename, g_filter.path) == NULL)
         return 0;
 
-    /* exclude paths — only applied to OPEN events */
-    if (e->type == EVENT_OPEN && g_filter.exclude_count > 0) {
+    /* exclude paths — applied to all file events */
+    if ((e->type == EVENT_OPEN   || e->type == EVENT_UNLINK ||
+         e->type == EVENT_RENAME || e->type == EVENT_CHMOD) &&
+        g_filter.exclude_count > 0) {
         for (int i = 0; i < g_filter.exclude_count; i++) {
             if (g_filter.excludes[i][0] &&
                 strncmp(e->filename, g_filter.excludes[i],
@@ -60,8 +68,23 @@ void print_header(const char *backend)
     if (g_fmt == OUTPUT_JSON)
         return;
 
-    printf("Tracing via %s (EXEC, OPEN, EXIT, CONNECT)... Ctrl-C to stop.\n",
-           backend);
+    static const struct { int bit; const char *name; } type_map[] = {
+        { TRACE_EXEC,    "EXEC"    }, { TRACE_OPEN,   "OPEN"   },
+        { TRACE_EXIT,    "EXIT"    }, { TRACE_CONNECT,"CONNECT"},
+        { TRACE_UNLINK,  "UNLINK"  }, { TRACE_RENAME, "RENAME" },
+        { TRACE_CHMOD,   "CHMOD"   }, { TRACE_BIND,   "BIND"   },
+        { TRACE_PTRACE,  "PTRACE"  },
+    };
+    int mask = g_filter.event_mask ? g_filter.event_mask : TRACE_ALL;
+    printf("Tracing via %s (", backend);
+    int first = 1;
+    for (int i = 0; i < 9; i++) {
+        if (mask & type_map[i].bit) {
+            printf("%s%s", first ? "" : ",", type_map[i].name);
+            first = 0;
+        }
+    }
+    printf(")... Ctrl-C to stop.\n");
 
     if (g_filter.pid)
         printf("  filter: pid=%d\n", g_filter.pid);
@@ -76,11 +99,13 @@ void print_header(const char *backend)
         g_filter.exclude_count)
         putchar('\n');
 
-    printf("\n%-5s  %-6s  %-6s  %-4s  %-4s  %-16s  %-32s  %s\n",
-           "TYPE", "PID", "PPID", "UID", "GID", "COMM", "LINEAGE", "DETAIL");
-    printf("%-5s  %-6s  %-6s  %-4s  %-4s  %-16s  %-32s  %s\n",
+    printf("\n%-5s  %-6s  %-6s  %-4s  %-4s  %-16s  %-24s  %-32s  %s\n",
+           "TYPE", "PID", "PPID", "UID", "GID", "COMM",
+           "CGROUP", "LINEAGE", "DETAIL");
+    printf("%-5s  %-6s  %-6s  %-4s  %-4s  %-16s  %-24s  %-32s  %s\n",
            "-----", "------", "------", "----", "----",
-           "----------------", "--------------------------------", "------");
+           "----------------", "------------------------",
+           "--------------------------------", "------");
 }
 
 static void text_event(const event_t *e)
@@ -88,12 +113,18 @@ static void text_event(const event_t *e)
     char chain[LINEAGE_BUF];
     lineage_str(e->ppid, chain, sizeof(chain));
 
-    printf("%-5s  %-6d  %-6d  %-4u  %-4u  %-16s  %-32s  ",
-           e->type == EVENT_EXEC    ? "EXEC"  :
-           e->type == EVENT_OPEN    ? "OPEN"  :
-           e->type == EVENT_EXIT    ? "EXIT"  :
-           e->type == EVENT_CONNECT ? "CONN"  : "?",
-           e->pid, e->ppid, e->uid, e->gid, e->comm, chain);
+    static const char *type_names[] = {
+        [EVENT_EXEC]    = "EXEC",  [EVENT_OPEN]    = "OPEN",
+        [EVENT_EXIT]    = "EXIT",  [EVENT_CONNECT] = "CONN",
+        [EVENT_UNLINK]  = "UNLNK",[EVENT_RENAME]  = "RENM",
+        [EVENT_CHMOD]   = "CMOD", [EVENT_BIND]    = "BIND",
+        [EVENT_PTRACE]  = "PTRC",
+    };
+    const char *tname = (e->type < EVENT_TYPE_MAX) ? type_names[e->type] : "?";
+
+    printf("%-5s  %-6d  %-6d  %-4u  %-4u  %-16s  %-24s  %-32s  ",
+           tname, e->pid, e->ppid, e->uid, e->gid, e->comm,
+           e->cgroup[0] ? e->cgroup : "-", chain);
 
     switch (e->type) {
     case EVENT_EXEC:
@@ -112,6 +143,28 @@ static void text_event(const event_t *e)
         printf("[%s] %s:%u", e->success ? "OK" : "FAIL", addr, e->dport);
         break;
     }
+    case EVENT_UNLINK:
+        printf("[%s] %s", e->success ? "OK" : "FAIL", e->filename);
+        break;
+    case EVENT_RENAME:
+        printf("[%s] %s -> %s", e->success ? "OK" : "FAIL",
+               e->filename, e->args);
+        break;
+    case EVENT_CHMOD:
+        printf("[%s] %s mode=0%o", e->success ? "OK" : "FAIL",
+               e->filename, e->mode);
+        break;
+    case EVENT_BIND: {
+        char addr[INET6_ADDRSTRLEN] = {};
+        inet_ntop(e->family == 2 ? AF_INET : AF_INET6,
+                  e->daddr, addr, sizeof(addr));
+        printf("[%s] %s:%u", e->success ? "OK" : "FAIL", addr, e->dport);
+        break;
+    }
+    case EVENT_PTRACE:
+        printf("[%s] req=%d target_pid=%d",
+               e->success ? "OK" : "FAIL", e->ptrace_req, e->target_pid);
+        break;
     }
     putchar('\n');
 }
@@ -146,17 +199,25 @@ static void json_event(const event_t *e)
         [EVENT_OPEN]    = "OPEN",
         [EVENT_EXIT]    = "EXIT",
         [EVENT_CONNECT] = "CONNECT",
+        [EVENT_UNLINK]  = "UNLINK",
+        [EVENT_RENAME]  = "RENAME",
+        [EVENT_CHMOD]   = "CHMOD",
+        [EVENT_BIND]    = "BIND",
+        [EVENT_PTRACE]  = "PTRACE",
     };
 
     char chain[LINEAGE_BUF];
     lineage_str(e->ppid, chain, sizeof(chain));
 
+    const char *ts = (e->type < EVENT_TYPE_MAX) ? type_str[e->type] : "UNKNOWN";
     printf("{\"type\":\"%s\","
            "\"pid\":%d,\"ppid\":%d,"
            "\"uid\":%u,\"gid\":%u,"
            "\"comm\":",
-           type_str[e->type], e->pid, e->ppid, e->uid, e->gid);
+           ts, e->pid, e->ppid, e->uid, e->gid);
     json_str(e->comm);
+    printf(",\"cgroup\":");
+    json_str(e->cgroup);
     printf(",\"lineage\":");
     json_str(chain);
 
@@ -183,6 +244,29 @@ static void json_event(const event_t *e)
                e->family, addr, e->dport);
         break;
     }
+    case EVENT_UNLINK:
+        printf(",\"filename\":"); json_str(e->filename);
+        break;
+    case EVENT_RENAME:
+        printf(",\"filename\":"); json_str(e->filename);
+        printf(",\"new_path\":"); json_str(e->args);
+        break;
+    case EVENT_CHMOD:
+        printf(",\"filename\":"); json_str(e->filename);
+        printf(",\"mode\":%u", e->mode);
+        break;
+    case EVENT_BIND: {
+        char addr[INET6_ADDRSTRLEN] = {};
+        inet_ntop(e->family == 2 ? AF_INET : AF_INET6,
+                  e->daddr, addr, sizeof(addr));
+        printf(",\"family\":%u,\"laddr\":\"%s\",\"lport\":%u",
+               e->family, addr, e->dport);
+        break;
+    }
+    case EVENT_PTRACE:
+        printf(",\"ptrace_req\":%d,\"target_pid\":%d",
+               e->ptrace_req, e->target_pid);
+        break;
     }
     puts("}");
 }
@@ -193,11 +277,11 @@ static void json_event(const event_t *e)
 
 typedef struct {
     char     comm[16];
-    uint64_t counts[4];   /* indexed by event_type_t */
+    uint64_t counts[EVENT_TYPE_MAX];   /* indexed by event_type_t */
 } comm_stat_t;
 
 static int         g_summary_interval = 0;
-static uint64_t    g_totals[4];
+static uint64_t    g_totals[EVENT_TYPE_MAX];
 static uint64_t    g_summary_drops;
 static comm_stat_t g_comm_stats[SUMMARY_MAX_COMMS];
 static int         g_comm_count;
@@ -215,7 +299,7 @@ void output_set_summary(int interval_secs)
 
 static void summary_record(const event_t *e)
 {
-    if (e->type < 4)
+    if (e->type < EVENT_TYPE_MAX)
         g_totals[e->type]++;
 
     /* find or create comm slot */
@@ -232,7 +316,7 @@ static void summary_record(const event_t *e)
         slot->comm[15] = '\0';
         memset(slot->counts, 0, sizeof(slot->counts));
     }
-    if (slot && e->type < 4)
+    if (slot && e->type < EVENT_TYPE_MAX)
         slot->counts[e->type]++;
 }
 
@@ -264,13 +348,22 @@ static void summary_flush(void)
         "════════════════════════════════════════════════════════";
     printf("\n%s\n", line);
     printf(" %lus summary\n", (unsigned long)g_summary_interval);
-    printf("  EXEC    %6llu", (unsigned long long)g_totals[EVENT_EXEC]);
-    print_top_comms(EVENT_EXEC, 5);    putchar('\n');
-    printf("  OPEN    %6llu", (unsigned long long)g_totals[EVENT_OPEN]);
-    print_top_comms(EVENT_OPEN, 5);    putchar('\n');
-    printf("  CONNECT %6llu", (unsigned long long)g_totals[EVENT_CONNECT]);
-    print_top_comms(EVENT_CONNECT, 5); putchar('\n');
-    printf("  EXIT    %6llu\n", (unsigned long long)g_totals[EVENT_EXIT]);
+    static const struct { event_type_t t; const char *label; } rows[] = {
+        { EVENT_EXEC,    "EXEC   " }, { EVENT_OPEN,   "OPEN   " },
+        { EVENT_CONNECT, "CONNECT" }, { EVENT_EXIT,   "EXIT   " },
+        { EVENT_UNLINK,  "UNLINK " }, { EVENT_RENAME, "RENAME " },
+        { EVENT_CHMOD,   "CHMOD  " }, { EVENT_BIND,   "BIND   " },
+        { EVENT_PTRACE,  "PTRACE " },
+    };
+    for (int r = 0; r < 9; r++) {
+        uint64_t n = g_totals[rows[r].t];
+        if (n == 0 && rows[r].t != EVENT_EXEC && rows[r].t != EVENT_OPEN)
+            continue;
+        printf("  %s %6llu", rows[r].label, (unsigned long long)n);
+        if (rows[r].t != EVENT_EXIT)
+            print_top_comms(rows[r].t, 5);
+        putchar('\n');
+    }
     if (g_summary_drops)
         printf("  DROPS   %6llu\n", (unsigned long long)g_summary_drops);
     printf("%s\n\n", line);

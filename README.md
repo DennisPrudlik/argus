@@ -1,6 +1,6 @@
 # Argus
 
-A lightweight Linux kernel telemetry tool built on eBPF. Traces process execution, file opens, network connections, and process exits system-wide with minimal overhead, with per-event process ancestry (`systemd→sshd→bash→curl`).
+A lightweight Linux kernel telemetry tool built on eBPF. Traces process execution, file opens, network connections, file deletions/renames/permission changes, socket binds, and ptrace calls system-wide with minimal overhead. Every event carries process ancestry (`systemd→sshd→bash→curl`) and the container cgroup name for immediate container attribution.
 
 ## Requirements
 
@@ -70,8 +70,9 @@ sudo ./argus [OPTIONS]
 | `--pid <pid>` | Only trace this PID (enforced in kernel) |
 | `--comm <name>` | Only trace this process name (enforced in kernel) |
 | `--path <str>` | Only show file events whose path contains this string (userspace) |
-| `--exclude <pfx>` | Exclude OPEN events whose path starts with this prefix (repeatable) |
-| `--events <list>` | Comma-separated event types to trace: `EXEC,OPEN,EXIT,CONNECT` |
+| `--exclude <pfx>` | Exclude file events (OPEN, UNLINK, RENAME, CHMOD) whose path starts with this prefix (repeatable) |
+| `--events <list>` | Comma-separated event types: `EXEC,OPEN,EXIT,CONNECT,UNLINK,RENAME,CHMOD,BIND,PTRACE` |
+| `--rate-limit <n>` | Drop events after N per second per process name (0 = off, kernel-enforced) |
 | `--ringbuf <kb>` | Ring buffer size in KB (default: 256) |
 | `--summary <secs>` | Rolling summary every N seconds instead of per-event output |
 | `--json` | Emit newline-delimited JSON instead of a text table |
@@ -95,6 +96,15 @@ sudo ./argus --pid 1234
 # Watch file opens under /etc, excluding /proc and /sys noise
 sudo ./argus --events OPEN --path /etc --exclude /proc --exclude /sys
 
+# Security-focused: file deletions, permission changes, and process injection
+sudo ./argus --events UNLINK,RENAME,CHMOD,PTRACE --json
+
+# Detect server-side network binds
+sudo ./argus --events BIND --json | jq 'select(.lport < 1024)'
+
+# Limit noisy processes to 100 events/sec each
+sudo ./argus --rate-limit 100
+
 # Rolling 10-second summary
 sudo ./argus --summary 10
 
@@ -104,8 +114,14 @@ sudo ./argus --events EXEC,CONNECT --json
 # JSON output, pipe into jq
 sudo ./argus --json | jq 'select(.type == "EXEC")'
 
+# Show only container events (non-empty cgroup)
+sudo ./argus --json | jq 'select(.cgroup != "")'
+
 # Use a config file
 sudo ./argus --config /etc/argus/config.json
+
+# Reload config without restarting
+sudo kill -HUP $(pidof argus)
 ```
 
 ## Output
@@ -113,14 +129,16 @@ sudo ./argus --config /etc/argus/config.json
 ### Text
 
 ```
-Tracing via eBPF (EXEC, OPEN, EXIT, CONNECT)... Ctrl-C to stop.
+Tracing via eBPF (EXEC,OPEN,EXIT,CONNECT,UNLINK,RENAME,CHMOD,BIND,PTRACE)... Ctrl-C to stop.
 
-TYPE   PID     PPID    UID   GID   COMM              LINEAGE                           DETAIL
------  ------  ------  ----  ----  ----------------  --------------------------------  ------
-EXEC   3821    3820    1000  1000  curl              systemd→sshd→bash                 /usr/bin/curl example.com
-OPEN   3821    3820    1000  1000  curl              systemd→sshd→bash                 [OK] /etc/ssl/certs/ca-certificates.crt
-CONN   3821    3820    1000  1000  curl              systemd→sshd→bash                 [OK] 93.184.216.34:443
-EXIT   3821    3820    1000  1000  curl              systemd→sshd→bash                 exit_code=0
+TYPE   PID     PPID    UID   GID   COMM              CGROUP                    LINEAGE                           DETAIL
+-----  ------  ------  ----  ----  ----------------  ------------------------  --------------------------------  ------
+EXEC   3821    3820    1000  1000  curl              -                         systemd→sshd→bash                 /usr/bin/curl example.com
+OPEN   3821    3820    1000  1000  curl              -                         systemd→sshd→bash                 [OK] /etc/ssl/certs/ca-certificates.crt
+CONN   3821    3820    1000  1000  curl              -                         systemd→sshd→bash                 [OK] 93.184.216.34:443
+EXIT   3821    3820    1000  1000  curl              -                         systemd→sshd→bash                 exit_code=0
+UNLNK  4102    4100    0     0     rm                docker-abc123.scope       systemd→containerd→sh             [OK] /tmp/secret.key
+PTRC   8801    8800    0     0     gdb               -                         systemd→sshd→bash                 [OK] req=16 target_pid=3821
 ```
 
 ### JSON (`--json`)
@@ -128,10 +146,12 @@ EXIT   3821    3820    1000  1000  curl              systemd→sshd→bash      
 One object per line, suitable for `jq`, log shippers, or SIEMs:
 
 ```json
-{"type":"EXEC","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"comm":"curl","lineage":"systemd→sshd→bash","duration_ns":41238,"success":true,"filename":"/usr/bin/curl","args":"example.com"}
-{"type":"OPEN","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"comm":"curl","lineage":"systemd→sshd→bash","duration_ns":9812,"success":true,"filename":"/etc/ssl/certs/ca-certificates.crt"}
-{"type":"CONNECT","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"comm":"curl","lineage":"systemd→sshd→bash","duration_ns":2301,"success":true,"family":2,"daddr":"93.184.216.34","dport":443}
-{"type":"EXIT","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"comm":"curl","lineage":"systemd→sshd→bash","duration_ns":0,"success":true,"exit_code":0}
+{"type":"EXEC","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"comm":"curl","cgroup":"","lineage":"systemd→sshd→bash","duration_ns":41238,"success":true,"filename":"/usr/bin/curl","args":"example.com"}
+{"type":"OPEN","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"comm":"curl","cgroup":"","lineage":"systemd→sshd→bash","duration_ns":9812,"success":true,"filename":"/etc/ssl/certs/ca-certificates.crt"}
+{"type":"CONNECT","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"comm":"curl","cgroup":"","lineage":"systemd→sshd→bash","duration_ns":2301,"success":true,"family":2,"daddr":"93.184.216.34","dport":443}
+{"type":"EXIT","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"comm":"curl","cgroup":"","lineage":"systemd→sshd→bash","duration_ns":0,"success":true,"exit_code":0}
+{"type":"UNLINK","pid":4102,"ppid":4100,"uid":0,"gid":0,"comm":"rm","cgroup":"docker-abc123.scope","lineage":"systemd→containerd→sh","duration_ns":312,"success":true,"filename":"/tmp/secret.key"}
+{"type":"PTRACE","pid":8801,"ppid":8800,"uid":0,"gid":0,"comm":"gdb","cgroup":"","lineage":"systemd→sshd→bash","duration_ns":88,"success":true,"ptrace_req":16,"target_pid":3821}
 ```
 
 If the ring buffer fills under load, a drop warning is emitted:
@@ -144,14 +164,21 @@ In `--json` mode this appears inline as `{"type":"DROP","count":14}`.
 
 ## Event Types
 
-| Type | Tracepoint | Fields |
+| Type | Tracepoint | Key Fields |
 |---|---|---|
 | `EXEC` | `syscalls/sys_{enter,exit}_execve` | `filename`, `args`, `duration_ns` |
 | `OPEN` | `syscalls/sys_{enter,exit}_openat` | `filename`, `success`, `duration_ns` |
 | `EXIT` | `sched/sched_process_exit` | `exit_code` |
-| `CONNECT` | `syscalls/sys_{enter,exit}_connect` | `family`, `daddr`, `dport`, `success`, `duration_ns` |
+| `CONNECT` | `syscalls/sys_{enter,exit}_connect` | `family`, `daddr`, `dport`, `success` |
+| `UNLINK` | `syscalls/sys_{enter,exit}_unlinkat` | `filename`, `success` |
+| `RENAME` | `syscalls/sys_{enter,exit}_renameat2` | `filename` (old), `new_path`, `success` |
+| `CHMOD` | `syscalls/sys_{enter,exit}_fchmodat` | `filename`, `mode`, `success` |
+| `BIND` | `syscalls/sys_{enter,exit}_bind` | `family`, `laddr`, `lport`, `success` |
+| `PTRACE` | `syscalls/sys_{enter,exit}_ptrace` | `ptrace_req`, `target_pid`, `success` |
 
-All events include: `pid`, `ppid`, `uid`, `gid`, `comm`, `lineage`.
+All events include: `pid`, `ppid`, `uid`, `gid`, `comm`, `cgroup`, `lineage`.
+
+The `cgroup` field contains the leaf cgroup name. For Docker containers this is the container scope name (e.g. `docker-abc123.scope`); for Kubernetes pods it is the container ID. Empty string on host processes.
 
 ### Summary mode (`--summary N`)
 
@@ -177,17 +204,32 @@ Argus loads `/etc/argus/config.json` then `~/.config/argus/config.json` on start
     "comm": "",
     "path": "",
     "exclude_paths": ["/proc", "/sys", "/dev"],
-    "event_types": ["EXEC", "OPEN", "EXIT", "CONNECT"],
+    "event_types": ["EXEC", "OPEN", "EXIT", "CONNECT", "UNLINK", "RENAME", "CHMOD", "BIND", "PTRACE"],
     "ring_buffer_kb": 256,
-    "summary_interval": 0
+    "summary_interval": 0,
+    "rate_limit_per_comm": 0
 }
 ```
 
-A config file is the recommended way to run argus as a persistent daemon — set `exclude_paths` to suppress `/proc`/`/sys` noise and `event_types` to limit which tracepoints are attached.
+A config file is the recommended way to run argus as a persistent daemon — set `exclude_paths` to suppress `/proc`/`/sys` noise, `event_types` to limit which tracepoints are attached, and `rate_limit_per_comm` to prevent any single process from flooding the ring buffer. Changes take effect immediately on `SIGHUP` without restarting.
 
 ## Kernel-side filtering
 
 `--pid` and `--comm` filters are pushed into BPF maps before any programs attach. The kernel drops non-matching events before they reach the ring buffer — filtered runs have near-zero overhead even on noisy hosts. `--path` and `--exclude` are evaluated in userspace after delivery. `--events` prevents the unused BPF programs from loading entirely.
+
+`--rate-limit N` enforces a per-comm sliding-window token bucket inside the BPF programs: once a process name emits more than N events per second, further events from that comm are silently dropped until the next 1-second window opens. Useful to prevent a single noisy process (e.g. a busy web server) from saturating the ring buffer.
+
+## Config reload (SIGHUP)
+
+Send `SIGHUP` to reload config files without restarting:
+
+```sh
+sudo kill -HUP $(pidof argus)
+# or
+sudo systemctl reload argus
+```
+
+On SIGHUP, argus re-reads `/etc/argus/config.json` and `~/.config/argus/config.json` and immediately updates the BPF filter maps (pid/comm allowlists, rate limit) and the userspace filters (path, excludes). The event type mask and ring buffer size remain fixed for the lifetime of the process — changing those requires a restart.
 
 ## Security
 

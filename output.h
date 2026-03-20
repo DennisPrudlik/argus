@@ -21,6 +21,9 @@ typedef struct {
 /* Call once at startup before any print_event / event_matches calls */
 void output_init(output_fmt_t fmt, const filter_t *filter);
 
+/* Hot-swap the active filter (used on SIGHUP config reload) */
+void output_update_filter(const filter_t *filter);
+
 /* Print column headers (text mode only; no-op in JSON and summary modes) */
 void print_header(const char *backend);
 

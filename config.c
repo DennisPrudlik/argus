@@ -94,6 +94,11 @@ static int parse_event_types(const char *p, int *mask)
         else if (strcmp(tok, "OPEN")    == 0) *mask |= TRACE_OPEN;
         else if (strcmp(tok, "EXIT")    == 0) *mask |= TRACE_EXIT;
         else if (strcmp(tok, "CONNECT") == 0) *mask |= TRACE_CONNECT;
+        else if (strcmp(tok, "UNLINK")  == 0) *mask |= TRACE_UNLINK;
+        else if (strcmp(tok, "RENAME")  == 0) *mask |= TRACE_RENAME;
+        else if (strcmp(tok, "CHMOD")   == 0) *mask |= TRACE_CHMOD;
+        else if (strcmp(tok, "BIND")    == 0) *mask |= TRACE_BIND;
+        else if (strcmp(tok, "PTRACE")  == 0) *mask |= TRACE_PTRACE;
         p = skip_ws(p);
         if (*p == ',') p++;
         p = skip_ws(p);
@@ -166,6 +171,11 @@ int cfg_load(const char *path, argus_cfg_t *cfg)
             p = parse_int(p, &cfg->ring_buffer_kb);
         else if (strcmp(key, "summary_interval") == 0)
             p = parse_int(p, &cfg->summary_interval);
+        else if (strcmp(key, "rate_limit_per_comm") == 0) {
+            int v = 0;
+            p = parse_int(p, &v);
+            cfg->rate_limit_per_comm = (uint32_t)v;
+        }
         else if (strcmp(key, "event_types") == 0)
             parse_event_types(p, &cfg->filter.event_mask);
         else if (strcmp(key, "exclude_paths") == 0) {

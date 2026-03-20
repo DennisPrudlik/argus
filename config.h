@@ -10,8 +10,9 @@
  */
 typedef struct {
     filter_t filter;
-    int      ring_buffer_kb;    /* ring buffer size; default 256           */
-    int      summary_interval;  /* 0 = per-event output, N = N-second roll */
+    int      ring_buffer_kb;        /* ring buffer size; default 256           */
+    int      summary_interval;      /* 0 = per-event output, N = N-second roll */
+    uint32_t rate_limit_per_comm;   /* 0 = disabled; N = max events/sec/comm   */
 } argus_cfg_t;
 
 /* Fill cfg with safe defaults (no filters, 256KB ring buffer, no summary) */
