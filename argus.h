@@ -14,6 +14,13 @@ typedef enum {
     EVENT_CONNECT = 3,
 } event_type_t;
 
+/* Bitmask values for filter_t.event_mask / argus_cfg_t event selection */
+#define TRACE_EXEC    (1 << EVENT_EXEC)
+#define TRACE_OPEN    (1 << EVENT_OPEN)
+#define TRACE_EXIT    (1 << EVENT_EXIT)
+#define TRACE_CONNECT (1 << EVENT_CONNECT)
+#define TRACE_ALL     (TRACE_EXEC | TRACE_OPEN | TRACE_EXIT | TRACE_CONNECT)
+
 typedef struct event {
     /* ── common fields ─────────────────────────────────── */
     uint64_t     duration_ns;

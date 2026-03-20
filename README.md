@@ -47,9 +47,14 @@ sudo ./argus [OPTIONS]
 
 | Option | Description |
 |---|---|
-| `--pid <pid>` | Only show events from this PID (enforced in kernel) |
-| `--comm <name>` | Only show events from processes with this name (enforced in kernel) |
+| `--config <path>` | Load config file (see [Config file](#config-file)) |
+| `--pid <pid>` | Only trace this PID (enforced in kernel) |
+| `--comm <name>` | Only trace this process name (enforced in kernel) |
 | `--path <str>` | Only show file events whose path contains this string (userspace) |
+| `--exclude <pfx>` | Exclude OPEN events whose path starts with this prefix (repeatable) |
+| `--events <list>` | Comma-separated event types to trace: `EXEC,OPEN,EXIT,CONNECT` |
+| `--ringbuf <kb>` | Ring buffer size in KB (default: 256) |
+| `--summary <secs>` | Rolling summary every N seconds instead of per-event output |
 | `--json` | Emit newline-delimited JSON instead of a text table |
 | `--help` | Show usage |
 
@@ -65,14 +70,20 @@ sudo ./argus --comm curl
 # Watch a specific PID
 sudo ./argus --pid 1234
 
-# Watch file opens under /etc
-sudo ./argus --path /etc
+# Watch file opens under /etc, excluding /proc and /sys noise
+sudo ./argus --events OPEN --path /etc --exclude /proc --exclude /sys
+
+# Rolling 10-second summary
+sudo ./argus --summary 10
+
+# Only trace EXEC and CONNECT, JSON output
+sudo ./argus --events EXEC,CONNECT --json
 
 # JSON output, pipe into jq
 sudo ./argus --json | jq 'select(.type == "EXEC")'
 
-# Filter by comm, JSON output
-sudo ./argus --comm nginx --json
+# Use a config file
+sudo ./argus --config /etc/argus/config.json
 ```
 
 ## Output
@@ -120,9 +131,41 @@ In `--json` mode this appears inline as `{"type":"DROP","count":14}`.
 
 All events include: `pid`, `ppid`, `uid`, `gid`, `comm`, `lineage`.
 
+### Summary mode (`--summary N`)
+
+Instead of per-event lines, print a rolling summary every N seconds:
+
+```
+════════════════════════════════════════════════════════
+ 10s summary
+  EXEC      47  bash(21)  python3(14)  sh(12)
+  OPEN    1823  nginx(891)  python3(512)  bash(420)
+  CONNECT    9  curl(6)  wget(3)
+  EXIT      44
+════════════════════════════════════════════════════════
+```
+
+## Config file
+
+Argus loads `~/.config/argus/config.json` then `/etc/argus/config.json` on startup (if present). CLI flags always override file values. All keys are optional.
+
+```json
+{
+    "pid": 0,
+    "comm": "",
+    "path": "",
+    "exclude_paths": ["/proc", "/sys", "/dev"],
+    "event_types": ["EXEC", "OPEN", "EXIT", "CONNECT"],
+    "ring_buffer_kb": 256,
+    "summary_interval": 0
+}
+```
+
+A config file is the recommended way to run argus as a persistent daemon — set `exclude_paths` to suppress `/proc`/`/sys` noise and `event_types` to limit which tracepoints are attached.
+
 ## Kernel-side filtering
 
-`--pid` and `--comm` filters are pushed into BPF maps before any programs attach. The kernel drops non-matching events before they reach the ring buffer — filtered runs have near-zero overhead even on noisy hosts. `--path` is evaluated in userspace after delivery.
+`--pid` and `--comm` filters are pushed into BPF maps before any programs attach. The kernel drops non-matching events before they reach the ring buffer — filtered runs have near-zero overhead even on noisy hosts. `--path` and `--exclude` are evaluated in userspace after delivery. `--events` prevents the unused BPF programs from loading entirely.
 
 ## Process lineage
 
@@ -157,15 +200,29 @@ limactl show-ssh --format config argus >> ~/.ssh/config
 # Then connect to host "lima-argus" in VS Code Remote SSH
 ```
 
+## Testing
+
+```sh
+# Unit tests — no root, no kernel required
+make test
+
+# Integration tests — requires root and a built argus binary
+make test-integration
+```
+
+Unit tests cover `event_matches` filter logic (pid, comm, path, excludes, event mask) and the lineage cache (chain building, tombstone deletion, buffer truncation). Integration tests start argus with `--pid`, `--comm`, `--events`, and `--exclude` filters against live kernel events and verify only matching events appear in the output.
+
 ## Repository layout
 
 ```
 argus.bpf.c     eBPF kernel programs (execve, openat, connect, sched_process_exit)
 argus.c         Userspace loader, ring buffer consumer, CLI
-output.c/h      Text and JSON formatting, event filtering
+output.c/h      Text and JSON formatting, filtering, summary mode
 lineage.c/h     Userspace process ancestry cache
-argus.h         Shared event struct and type definitions
+config.c/h      JSON config file parser
+argus.h         Shared event struct, type definitions, TRACE_* bitmasks
+tests/          Unit tests (test_lineage.c, test_output.c) and integration test (test_filter.sh)
 lima/           Lima VM config for development on non-Linux hosts
 .devcontainer/  VS Code Dev Container config (alternative to Lima)
-Makefile        Build entry point
+Makefile        Build entry point (targets: all, test, test-integration, clean)
 ```
