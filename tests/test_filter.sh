@@ -96,16 +96,19 @@ echo "Test 1: --pid filter"
 MY_PID=$$
 start_argus --pid "$MY_PID"
 
-# Generate OPEN event from our own PID using shell file-descriptor (no subprocess)
-exec 3</etc/hostname
-exec 3<&-
+# Generate multiple OPEN events from our own PID using shell fd redirects.
+# Repeat several times so at least one is caught by the 100ms ring-buffer poll.
+for i in 1 2 3 4 5; do
+    exec 3</proc/self/status
+    exec 3<&-
+done
 
 # Generate events from a different PID (background subshell) to verify filtering
 bash -c "sleep 0.05; ls /tmp >/dev/null 2>&1" &
 OTHER_PID=$!
 wait "$OTHER_PID" 2>/dev/null || true
 
-sleep 0.5
+sleep 0.8
 stop_argus
 
 # Verify: all events should have pid == MY_PID
@@ -147,7 +150,8 @@ echo "Test 2: --comm filter"
 start_argus --comm ls
 
 ls /tmp >/dev/null 2>&1   # trigger matching event
-sleep 0.3
+ls /tmp >/dev/null 2>&1   # repeat to ensure capture
+sleep 0.8
 stop_argus
 
 GOT_LS=$(count_events "comm=ls")
