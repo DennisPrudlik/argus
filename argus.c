@@ -286,6 +286,9 @@ static void setup_bpf_filters(struct argus_bpf *skel, const filter_t *f,
 static void configure_programs(struct argus_bpf *skel, int event_mask,
                                int follow_pid)
 {
+    /* 0 means trace-all (same convention as print_header / event_matches) */
+    if (!event_mask) event_mask = TRACE_ALL;
+
     /* Fork handler is only useful when --follow is active */
     if (!follow_pid)
         bpf_program__set_autoload(skel->progs.handle_process_fork, false);

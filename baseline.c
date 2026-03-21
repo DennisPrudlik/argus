@@ -348,6 +348,7 @@ int baseline_load(const char *path)
     const char *p = buf;
     while (*p) {
         p = bl_skip_ws(p);
+        if (!*p) break;
         if (*p != '"') { p++; continue; }
 
         char key[64] = {};
@@ -367,6 +368,7 @@ int baseline_load(const char *path)
             p++;  /* skip '{' */
             while (*p && *p != '}') {
                 p = bl_skip_ws(p);
+                if (!*p || *p == '}') break;
                 if (*p != '"') { p++; continue; }
                 char field[64] = {};
                 p = bl_parse_str(p, field, sizeof(field));
