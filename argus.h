@@ -1,7 +1,7 @@
 #ifndef __ARGUS_H
 #define __ARGUS_H
 
-#define ARGUS_VERSION "0.2.0"
+#define ARGUS_VERSION "0.3.0"
 
 /* vmlinux.h (BPF context) already provides these types */
 #ifndef __VMLINUX_H__

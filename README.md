@@ -2,7 +2,9 @@
 
 A lightweight Linux kernel telemetry and threat-detection tool built on eBPF. Traces 21 event types system-wide — process execution, file access, network connections, privilege escalation, memory execution, kernel-module loading, namespace escapes, DNS queries, TLS SNI extraction, and more — with minimal overhead. Every event carries full process ancestry (`systemd→sshd→bash→curl`) and the container cgroup name for immediate container attribution.
 
-**Version 0.2.0** — Adds 12 new kernel-traced event types, active response (BPF kill), threat-intel feed integration, file integrity monitoring, LD_PRELOAD detection, DGA/C2 entropy detection, DNS→IP correlation, per-PID rate limiting, Prometheus metrics, cgroup-aware baselines, rolling baseline merge, alert suppression, process-ancestry rule matching, fleet aggregation server, canary/honeypot file detection, alert deduplication, process hollowing detection, C2 beaconing detection, syscall attack-chain detection, YARA scanning, fleet correlation engine, and LSM BPF enforcement mode.
+**Version 0.3.0** — Adds canary/honeypot file detection, alert deduplication, process hollowing detection, C2 beaconing detection, syscall attack-chain detection (MEMEXEC→EXEC, PTRACE→EXEC, PRIVESC→shell, NS_ESCAPE→EXEC), YARA rule scanning, cross-host fleet correlation in `argus-server`, and LSM BPF in-kernel enforcement mode.
+
+**Version 0.2.0** — Added 12 new kernel-traced event types, active response (BPF kill), threat-intel CIDR feed, file integrity monitoring, LD_PRELOAD detection, DGA/entropy detection, DNS→IP correlation, per-PID rate limiting, Prometheus metrics, cgroup-aware baselines, rolling baseline merge, alert suppression, process-ancestry rule matching, and fleet aggregation server.
 
 ## Requirements
 
@@ -61,11 +63,11 @@ Build a native package for deployment on other machines:
 ```sh
 # Debian / Ubuntu (.deb) — requires dpkg-deb
 make deb
-# → argus_0.2.0_x86_64.deb
+# → argus_0.3.0_x86_64.deb
 
 # Fedora / RHEL (.rpm) — requires rpmbuild
 make rpm
-# → ~/rpmbuild/RPMS/.../argus-0.2.0-1.x86_64.rpm
+# → ~/rpmbuild/RPMS/.../argus-0.3.0-1.x86_64.rpm
 ```
 
 Both packages install the binary to `/usr/local/bin/argus` and include the systemd unit, tmpfiles.d config, and logrotate config.
@@ -310,9 +312,9 @@ One object per line, suitable for `jq`, log shippers, or SIEMs.
 ArcSight Common Event Format v0. Severity mapping: EXEC/OPEN/EXIT/CONNECT/BIND/DNS/SEND → 3 (Low), UNLINK/RENAME/CHMOD/WRITE_CLOSE/NET_CORR → 5 (Medium), PTRACE/MEMEXEC/PROC_SCRAPE → 8 (High), PRIVESC/KMOD_LOAD/THREAT_INTEL/NS_ESCAPE → 9 (Very High).
 
 ```
-CEF:0|argus|argus|0.2.0|PRIVESC|Privilege Escalation|9|spid=1024 suid=1000 sgid=1000 dproc=sudo suser=alice flexString1Label=lineage flexString1=systemd→sshd→bash cs2Label=uid_before cs2=1000 cs3Label=uid_after cs3=0
-CEF:0|argus|argus|0.2.0|KMOD_LOAD|Kernel Module Load|9|spid=5001 suid=0 sgid=0 dproc=insmod suser=root flexString1Label=lineage flexString1=systemd→bash fname=/tmp/evil.ko
-CEF:0|argus|argus|0.2.0|THREAT_INTEL|Threat Intel Match|9|spid=8801 suid=0 sgid=0 dproc=nc suser=root dst=198.51.100.5 dpt=4444
+CEF:0|argus|argus|0.3.0|PRIVESC|Privilege Escalation|9|spid=1024 suid=1000 sgid=1000 dproc=sudo suser=alice flexString1Label=lineage flexString1=systemd→sshd→bash cs2Label=uid_before cs2=1000 cs3Label=uid_after cs3=0
+CEF:0|argus|argus|0.3.0|KMOD_LOAD|Kernel Module Load|9|spid=5001 suid=0 sgid=0 dproc=insmod suser=root flexString1Label=lineage flexString1=systemd→bash fname=/tmp/evil.ko
+CEF:0|argus|argus|0.3.0|THREAT_INTEL|Threat Intel Match|9|spid=8801 suid=0 sgid=0 dproc=nc suser=root dst=198.51.100.5 dpt=4444
 ```
 
 ### Summary mode (`--summary N`)
@@ -404,7 +406,7 @@ The **BPF kill list** (`--response-kill` + rule `"action": "kill"`) writes the t
 
 ```
 # Emerging threats feed
-192.0.2.0/24
+192.0.3.0/24
 198.51.100.0/24
 203.0.113.128/25
 ```
