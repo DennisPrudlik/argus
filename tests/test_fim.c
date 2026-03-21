@@ -3,9 +3,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include "../tests/framework.h"
-#include "../fim.h"
-#include "../argus.h"
+#include "framework.h"
+#include "../src/fim.h"
+#include "../src/argus.h"
 
 /* ── helpers ───────────────────────────────────────────────────────────── */
 

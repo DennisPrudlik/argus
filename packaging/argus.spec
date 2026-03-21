@@ -1,5 +1,5 @@
 Name:           argus
-Version:        0.1.0
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        eBPF-based syscall telemetry daemon
 
@@ -25,10 +25,10 @@ Features:
   - Baseline / anomaly detection mode
 
 %install
-install -Dm755 %{_builddir}/argus              %{buildroot}%{_bindir}/argus
-install -Dm644 %{_builddir}/argus.service      %{buildroot}/etc/systemd/system/argus.service
-install -Dm644 %{_builddir}/argus.tmpfiles     %{buildroot}/usr/lib/tmpfiles.d/argus.conf
-install -Dm644 %{_builddir}/argus.logrotate    %{buildroot}/etc/logrotate.d/argus
+install -Dm755 %{_builddir}/argus                          %{buildroot}%{_bindir}/argus
+install -Dm644 %{_builddir}/packaging/argus.service        %{buildroot}/etc/systemd/system/argus.service
+install -Dm644 %{_builddir}/packaging/argus.tmpfiles       %{buildroot}/usr/lib/tmpfiles.d/argus.conf
+install -Dm644 %{_builddir}/packaging/argus.logrotate      %{buildroot}/etc/logrotate.d/argus
 
 %files
 %{_bindir}/argus

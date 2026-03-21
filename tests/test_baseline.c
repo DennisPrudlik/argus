@@ -16,9 +16,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
-#include "../baseline.h"
-#include "../output.h"
-#include "../argus.h"
+#include "../src/baseline.h"
+#include "../src/output.h"
+#include "../src/argus.h"
 #include "framework.h"
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */

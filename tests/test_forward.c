@@ -7,9 +7,9 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include "../forward.h"
-#include "../output.h"
-#include "../argus.h"
+#include "../src/forward.h"
+#include "../src/output.h"
+#include "../src/argus.h"
 #include "framework.h"
 
 /* ── forward_parse_addr tests ─────────────────────────────────────────────── */

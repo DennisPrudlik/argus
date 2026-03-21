@@ -3,8 +3,8 @@
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
-#include "../tests/framework.h"
-#include "../threatintel.h"
+#include "framework.h"
+#include "../src/threatintel.h"
 
 /*
  * test_netcorr.c — unit tests for DNS correlation cache, entropy function,

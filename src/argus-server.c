@@ -40,6 +40,9 @@
 #define MAX_CLIENTS     64
 #define LINE_BUF_SZ     4096
 
+/* forward declaration — defined in globals section below */
+static FILE *g_out;
+
 /* ── fleet correlation engine ────────────────────────────────────────────── */
 
 #define CORR_SLOTS      2048   /* hash table size for IOC tracking            */

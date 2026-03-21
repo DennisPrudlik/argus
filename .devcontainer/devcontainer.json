@@ -24,7 +24,7 @@
 
     // Pre-generate vmlinux.h from the running kernel the first time the
     // container is created.  The file is .gitignored so it stays local.
-    "postCreateCommand": "bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h && echo 'vmlinux.h generated'",
+    "postCreateCommand": "mkdir -p src/bpf && bpftool btf dump file /sys/kernel/btf/vmlinux format c > src/bpf/vmlinux.h && echo 'vmlinux.h generated'",
 
     "customizations": {
         "vscode": {
@@ -39,7 +39,8 @@
             "settings": {
                 "C_Cpp.default.compilerPath": "/usr/bin/clang",
                 "C_Cpp.default.includePath": [
-                    "${workspaceFolder}",
+                    "${workspaceFolder}/src",
+                    "${workspaceFolder}/src/bpf",
                     "/usr/include",
                     "/usr/include/x86_64-linux-gnu"
                 ]

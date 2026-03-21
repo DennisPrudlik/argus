@@ -977,47 +977,52 @@ limactl show-ssh --format config argus >> ~/.ssh/config
 ## Repository layout
 
 ```
-argus.bpf.c          eBPF kernel programs — all 21 event types; BPF maps for kill list,
-                       threat-intel LPM trie, rate limiting, per-syscall scratch buffers;
-                       LSM hooks for in-kernel enforcement (file_open, bprm_check, socket_connect)
-argus.c              Userspace loader, ring buffer consumer, CLI, DNS correlation cache,
-                       DGA entropy detection, LD_PRELOAD check dispatch, FIM dispatch,
-                       canary/hollow/beacon/seqdetect/yara dispatch
-output.c/h           Text, JSON, CEF, and syslog formatting for all 21 event types;
-                       filtering; summary mode; uid→username enrichment
-rules.c/h            Alert rule engine: JSON loading, field matching (incl. parent_comm,
-                       ancestor_comm), threshold/suppression, action=kill dispatch
-forward.c/h          Multi-target TCP event forwarding with optional TLS
-dns.c/h              Reverse-DNS lookup cache (512 entries, 300 s TTL)
-baseline.c/h         Baseline / anomaly detection: cgroup-aware keys, rolling merge
-fim.c/h              File Integrity Monitoring: SHA-256 hashing, change detection
-ldpreload.c/h        LD_PRELOAD / LD_LIBRARY_PATH / PYTHONPATH injection detection
-threatintel.c/h      Threat-intel CIDR feed loader into BPF LPM trie
-metrics.c/h          Prometheus metrics HTTP endpoint (background pthread)
-seccomp.c/h          Seccomp BPF denylist: blocks exec/fork/ptrace/setuid after priv-drop
-lineage.c/h          Userspace process ancestry cache; parent_comm/ancestor_comm queries
-config.c/h           JSON config file parser
-canary.c/h           Honeypot file detection: exact-path and prefix matching across event types
-dedup.c/h            Alert deduplication: 512-slot hash table with per-key time window
-hollow.c/h           Process hollowing detection: exe vs. maps comparison, fileless execution
-beacon.c/h           C2 beaconing detection: per-(pid,dest) CV of CONNECT inter-arrivals
-seqdetect.c/h        Syscall attack-chain detection: MEMEXEC→EXEC, PTRACE→EXEC, etc.
-yara_scan.c/h        YARA rule scanning on EXEC, WRITE_CLOSE, KMOD_LOAD (optional libyara)
-argus.h              Shared event struct, 21 type definitions, TRACE_* bitmasks,
-                       kernel_rule_t and argus_config_t shared between BPF and userspace
-argus-server.c       Fleet aggregator: multi-sensor TCP receiver, host field injection,
-                       cross-host IOC correlation engine (FLEET_CORR alerts)
-argus.8              Man page
-argus.spec           RPM spec file (make rpm)
-argus.service        systemd service unit
-argus.tmpfiles       systemd-tmpfiles config for /var/log/argus pre-creation
-argus.logrotate      logrotate config (daily, 14 days, compressed)
-tests/               Unit tests (test_lineage, test_output, test_rules, test_forward,
-                       test_baseline, test_metrics, test_fim, test_netcorr) and
-                       integration test (test_filter.sh)
-lima/                Lima VM config for development on non-Linux hosts
-.devcontainer/       VS Code Dev Container config
-.github/workflows/   GitHub Actions CI (ubuntu-latest + ubuntu-22.04 matrix)
-Makefile             Build entry point (targets: all, test, test-asan, test-integration,
-                       install, deb, rpm, man, clean)
+src/
+├── bpf/
+│   └── argus.bpf.c      eBPF kernel programs — all 21 event types; BPF maps for kill list,
+│                          threat-intel LPM trie, rate limiting, per-syscall scratch buffers;
+│                          LSM hooks for in-kernel enforcement (file_open, bprm_check, socket_connect)
+├── argus.c              Userspace loader, ring buffer consumer, CLI, DNS correlation cache,
+│                          DGA entropy detection, LD_PRELOAD check dispatch, FIM dispatch,
+│                          canary/hollow/beacon/seqdetect/yara dispatch
+├── argus-server.c       Fleet aggregator: multi-sensor TCP receiver, host field injection,
+│                          cross-host IOC correlation engine (FLEET_CORR alerts)
+├── argus.h              Shared event struct, 21 type definitions, TRACE_* bitmasks,
+│                          kernel_rule_t and argus_config_t shared between BPF and userspace
+├── output.c/h           Text, JSON, CEF, and syslog formatting; filtering; summary mode
+├── rules.c/h            Alert rule engine: JSON loading, field matching, threshold/suppression
+├── forward.c/h          Multi-target TCP event forwarding with optional TLS
+├── dns.c/h              Reverse-DNS lookup cache (512 entries, 300 s TTL)
+├── baseline.c/h         Baseline / anomaly detection: cgroup-aware keys, rolling merge
+├── fim.c/h              File Integrity Monitoring: SHA-256 hashing, change detection
+├── ldpreload.c/h        LD_PRELOAD / LD_LIBRARY_PATH / PYTHONPATH injection detection
+├── threatintel.c/h      Threat-intel CIDR feed loader into BPF LPM trie
+├── metrics.c/h          Prometheus metrics HTTP endpoint (background pthread)
+├── seccomp.c/h          Seccomp BPF denylist: blocks exec/fork/ptrace/setuid after priv-drop
+├── lineage.c/h          Userspace process ancestry cache; parent_comm/ancestor_comm queries
+├── config.c/h           JSON config file parser
+├── canary.c/h           Honeypot file detection: exact-path and prefix matching
+├── dedup.c/h            Alert deduplication: 512-slot hash table with per-key time window
+├── hollow.c/h           Process hollowing detection: exe vs. maps comparison, fileless execution
+├── beacon.c/h           C2 beaconing detection: per-(pid,dest) CV of CONNECT inter-arrivals
+├── seqdetect.c/h        Syscall attack-chain detection: MEMEXEC→EXEC, PTRACE→EXEC, etc.
+└── yara_scan.c/h        YARA rule scanning on EXEC, WRITE_CLOSE, KMOD_LOAD (optional libyara)
+
+man/
+└── argus.8              Man page
+
+packaging/
+├── argus.service        systemd service unit
+├── argus.tmpfiles       systemd-tmpfiles config for /var/log/argus pre-creation
+├── argus.logrotate      logrotate config (daily, 14 days, compressed)
+└── argus.spec           RPM spec file (make rpm)
+
+tests/                   Unit tests (test_lineage, test_output, test_rules, test_forward,
+                           test_baseline, test_metrics, test_fim, test_netcorr) and
+                           integration test (test_filter.sh)
+lima/                    Lima VM config for development on non-Linux hosts
+.devcontainer/           VS Code Dev Container config
+.github/workflows/       GitHub Actions CI (ubuntu-latest + ubuntu-22.04 matrix)
+Makefile                 Build entry point (targets: all, test, test-asan, test-integration,
+                           install, deb, rpm, man, clean)
 ```

@@ -2,9 +2,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include "../rules.h"
-#include "../output.h"
-#include "../argus.h"
+#include "../src/rules.h"
+#include "../src/output.h"
+#include "../src/argus.h"
 #include "framework.h"
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */

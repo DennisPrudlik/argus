@@ -1,5 +1,5 @@
 #include <string.h>
-#include "../lineage.h"
+#include "../src/lineage.h"
 #include "framework.h"
 
 /* Reset the table between tests by removing all entries we added */

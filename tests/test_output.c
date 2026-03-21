@@ -1,6 +1,6 @@
 #include <string.h>
-#include "../output.h"
-#include "../argus.h"
+#include "../src/output.h"
+#include "../src/argus.h"
 #include "framework.h"
 
 /* Build a minimal event_t for testing */
