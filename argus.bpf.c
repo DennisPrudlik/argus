@@ -258,36 +258,46 @@ static __always_inline int should_filter_out(uint32_t pid, char comm[16])
  * kernel_rule_drop — check whether a (pid, comm, event_type, uid) tuple
  * matches any active kernel_rules entry.  Returns 1 to drop, 0 to pass.
  * Called from each BPF exit handler BEFORE reserving ring-buffer space.
+ *
+ * Implementation note: kernel 5.15's BPF verifier rejects ANY backwards
+ * branch as a potential infinite loop — even inside bounded loops with a
+ * `continue`.  The only portable fix is to emit the 16-slot check as
+ * fully manual-unrolled code with zero backwards jumps.
+ *
+ * KR_COMM_NEQ: true if the rule comm and event comm differ.
+ *   Uses chained `||` (all forward short-circuit branches).
+ * KR_CHECK(n): check one slot.  All branches are forward-only:
+ *   map lookup returns NULL → skip (forward),
+ *   active==0 → skip (forward), type/uid/comm mismatch → skip (forward).
  */
-static __always_inline int kernel_rule_drop(uint32_t pid __attribute__((unused)),
-                                            char comm[16], int etype,
-                                            uint32_t uid)
+#define KR_COMM_NEQ(r, c) \
+    ((r)[0]!=(c)[0] || (r)[1]!=(c)[1] || (r)[2]!=(c)[2] || (r)[3]!=(c)[3] || \
+     (r)[4]!=(c)[4] || (r)[5]!=(c)[5] || (r)[6]!=(c)[6] || (r)[7]!=(c)[7] || \
+     (r)[8]!=(c)[8] || (r)[9]!=(c)[9] || (r)[10]!=(c)[10]|| (r)[11]!=(c)[11]|| \
+     (r)[12]!=(c)[12]|| (r)[13]!=(c)[13]|| (r)[14]!=(c)[14]|| (r)[15]!=(c)[15])
+
+#define KR_CHECK(n, etype_arg, uid_arg, comm_arg) do {          \
+    uint32_t _ki = (n);                                          \
+    kernel_rule_t *_r = bpf_map_lookup_elem(&kernel_rules, &_ki);\
+    if (_r && _r->active &&                                      \
+        (_r->event_type == -1 || _r->event_type == (etype_arg)) &&\
+        (_r->uid == 0xFFFFFFFFU || _r->uid == (uid_arg))  &&    \
+        (_r->comm[0] == '\0'  || !KR_COMM_NEQ(_r->comm, (comm_arg))))\
+        return 1;                                                \
+} while (0)
+
+static __always_inline int kernel_rule_drop(
+        uint32_t pid __attribute__((unused)),
+        char comm[16], int etype, uint32_t uid)
 {
-    /* Bounded loop — verifier sees exactly KERNEL_RULES_MAX iterations */
-    #pragma unroll
-    for (uint32_t i = 0; i < KERNEL_RULES_MAX; i++) {
-        kernel_rule_t *r = bpf_map_lookup_elem(&kernel_rules, &i);
-        if (!r || !r->active)
-            continue;
-        /* event_type: -1 = wildcard */
-        if (r->event_type != -1 && r->event_type != etype)
-            continue;
-        /* uid: 0xFFFFFFFF = wildcard */
-        if (r->uid != 0xFFFFFFFFU && r->uid != uid)
-            continue;
-        /* comm: all-zero = wildcard */
-        if (r->comm[0] != '\0') {
-            int match = 1;
-            #pragma unroll
-            for (int j = 0; j < 16; j++) {
-                if (r->comm[j] != comm[j]) { match = 0; break; }
-                if (r->comm[j] == '\0') break;
-            }
-            if (!match)
-                continue;
-        }
-        return 1;   /* drop this event */
-    }
+    KR_CHECK( 0, etype, uid, comm); KR_CHECK( 1, etype, uid, comm);
+    KR_CHECK( 2, etype, uid, comm); KR_CHECK( 3, etype, uid, comm);
+    KR_CHECK( 4, etype, uid, comm); KR_CHECK( 5, etype, uid, comm);
+    KR_CHECK( 6, etype, uid, comm); KR_CHECK( 7, etype, uid, comm);
+    KR_CHECK( 8, etype, uid, comm); KR_CHECK( 9, etype, uid, comm);
+    KR_CHECK(10, etype, uid, comm); KR_CHECK(11, etype, uid, comm);
+    KR_CHECK(12, etype, uid, comm); KR_CHECK(13, etype, uid, comm);
+    KR_CHECK(14, etype, uid, comm); KR_CHECK(15, etype, uid, comm);
     return 0;
 }
 
