@@ -94,12 +94,13 @@ echo ""
 echo "Test 1: --pid filter"
 
 MY_PID=$$
-start_argus --pid "$MY_PID"
+start_argus --pid "$MY_PID" --events OPEN
 
 # Generate multiple OPEN events from our own PID using shell fd redirects.
+# Use /etc/hostname (a real non-/proc file) to avoid any /proc path quirks.
 # Repeat several times so at least one is caught by the 100ms ring-buffer poll.
 for i in 1 2 3 4 5; do
-    exec 3</proc/self/status
+    exec 3</etc/hostname
     exec 3<&-
 done
 
@@ -147,7 +148,7 @@ rm -f "$OUTFILE"
 echo ""
 echo "Test 2: --comm filter"
 
-start_argus --comm ls
+start_argus --comm ls --events EXEC
 
 ls /tmp >/dev/null 2>&1   # trigger matching event
 ls /tmp >/dev/null 2>&1   # repeat to ensure capture
