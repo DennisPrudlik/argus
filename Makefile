@@ -74,7 +74,7 @@ tests/test_output: tests/test_output.c $(COMMON_SRCS) $(COMMON_HDRS)
 
 tests/test_rules: tests/test_rules.c rules.c $(COMMON_SRCS) \
                   rules.h $(COMMON_HDRS)
-	$(CC) $(CFLAGS) -o $@ tests/test_rules.c rules.c $(COMMON_SRCS) -lpthread
+	$(CC) $(CFLAGS) -o $@ tests/test_rules.c rules.c $(COMMON_SRCS) -lpthread -lbpf
 
 tests/test_forward: tests/test_forward.c forward.c $(COMMON_SRCS) \
                     forward.h $(COMMON_HDRS)

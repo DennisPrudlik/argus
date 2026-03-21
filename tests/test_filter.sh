@@ -508,22 +508,22 @@ rm -f "$OUT_FILE"
 echo ""
 echo "Test 14: --follow PID subtree tracking"
 
-# Start a long-running parent process whose children we want to track
-bash -c "sleep 30" &
+# Start a parent bash process that actively forks children via a loop.
+# Using multiple commands ensures bash stays alive (doesn't exec the last cmd)
+# so PARENT_PID remains the bash process and each loop iteration forks a child.
+bash -c "for i in 1 2 3 4 5 6 7 8 9 10; do /bin/true; sleep 0.15; done; sleep 60" &
 PARENT_PID=$!
 
 start_argus --follow "$PARENT_PID" --events EXEC
 
-# Spawn a child from the tracked parent
-bash -c "kill -0 $PARENT_PID 2>/dev/null && bash -c 'ls /tmp >/dev/null 2>&1'" &
-sleep 0.6
+# Give the parent time to fork several children while argus is watching
+sleep 2.0
 
-# Now spawn an unrelated process (should NOT appear)
+# Spawn an unrelated process (should NOT appear in follow output)
 bash -c "cat /etc/hostname >/dev/null 2>&1" &
 UNRELATED_PID=$!
 wait "$UNRELATED_PID" 2>/dev/null || true
 
-sleep 0.5
 stop_argus
 kill "$PARENT_PID" 2>/dev/null || true
 wait "$PARENT_PID" 2>/dev/null || true

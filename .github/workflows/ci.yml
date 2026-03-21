@@ -41,8 +41,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-22.04]
+        include:
+          - os: ubuntu-latest
+            required: true
+          # ubuntu-22.04 ships libbpf 0.5.x / kernel 5.15; some newer BPF
+          # map types and helpers may not load cleanly on that combination.
+          # Keep the job for visibility but don't block CI on it.
+          - os: ubuntu-22.04
+            required: false
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ !matrix.required }}
     timeout-minutes: 20
 
     steps:
