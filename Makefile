@@ -52,7 +52,7 @@ argus: argus.c output.c lineage.c config.c rules.c forward.c dns.c \
 	$(CC) $(CFLAGS) -o $@ argus.c output.c lineage.c config.c rules.c \
 	    forward.c dns.c baseline.c seccomp.c metrics.c \
 	    fim.c ldpreload.c threatintel.c \
-	    -lbpf -lelf -lz -lpthread $(OPENSSL_LIBS)
+	    -lbpf -lelf -lz -lpthread -lm $(OPENSSL_LIBS)
 
 # 5. Fleet aggregator — no BPF dependency
 argus-server: argus-server.c argus.h
@@ -91,7 +91,7 @@ tests/test_fim: tests/test_fim.c fim.c fim.h argus.h
 	$(CC) $(CFLAGS) -o $@ tests/test_fim.c fim.c
 
 tests/test_netcorr: tests/test_netcorr.c threatintel.c threatintel.h argus.h
-	$(CC) $(CFLAGS) -o $@ tests/test_netcorr.c threatintel.c -lpthread
+	$(CC) $(CFLAGS) -o $@ tests/test_netcorr.c threatintel.c -lpthread -lbpf -lm
 
 test-unit: tests/test_lineage tests/test_output tests/test_rules \
            tests/test_forward tests/test_baseline tests/test_metrics \
