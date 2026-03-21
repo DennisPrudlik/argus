@@ -1,7 +1,7 @@
 #ifndef __ARGUS_H
 #define __ARGUS_H
 
-#define ARGUS_VERSION "0.3.0"
+#define ARGUS_VERSION "0.4.0"
 
 /* vmlinux.h (BPF context) already provides these types */
 #ifndef __VMLINUX_H__
@@ -31,9 +31,11 @@ typedef enum {
     EVENT_TLS_SNI       = 18,  /* TLS ClientHello SNI hostname (uprobe SSL_write) */
     EVENT_PROC_SCRAPE   = 19,  /* /proc/<pid>/mem|maps|fd read by foreign proc   */
     EVENT_NS_ESCAPE     = 20,  /* setns/unshare/clone with CLONE_NEW* flags      */
+    EVENT_TLS_DATA      = 21,  /* decrypted TLS payload (uprobe SSL_read)         */
+    EVENT_HEARTBEAT     = 22,  /* agent liveness ping (userspace-generated)       */
 } event_type_t;
 
-#define EVENT_TYPE_MAX 21   /* highest event_type_t value + 1 */
+#define EVENT_TYPE_MAX 23   /* highest event_type_t value + 1 */
 
 /* Bitmask values for filter_t.event_mask / argus_cfg_t event selection */
 #define TRACE_EXEC          (1 << EVENT_EXEC)
@@ -57,6 +59,8 @@ typedef enum {
 #define TRACE_TLS_SNI       (1 << EVENT_TLS_SNI)
 #define TRACE_PROC_SCRAPE   (1 << EVENT_PROC_SCRAPE)
 #define TRACE_NS_ESCAPE     (1 << EVENT_NS_ESCAPE)
+#define TRACE_TLS_DATA      (1 << EVENT_TLS_DATA)
+/* EVENT_HEARTBEAT is internal only — no TRACE_ bit */
 
 #define TRACE_ALL  (TRACE_EXEC | TRACE_OPEN | TRACE_EXIT | TRACE_CONNECT | \
                     TRACE_UNLINK | TRACE_RENAME | TRACE_CHMOD | \
@@ -117,6 +121,13 @@ typedef struct event {
 
     /* ── container / cgroup ─────────────────────────────────── */
     char         cgroup[64];  /* leaf cgroup name; empty string on host     */
+
+    /* ── enrichment (userspace-filled, not from BPF) ────────── */
+    char         sha256[65];  /* SHA-256 hex of executed binary (EXEC only) */
+
+    /* ── EVENT_TLS_DATA ──────────────────────────────────────── */
+    char         tls_payload[256]; /* first 256 bytes of decrypted TLS data */
+    uint32_t     tls_payload_len;  /* actual captured length                */
 } event_t;
 
 /*

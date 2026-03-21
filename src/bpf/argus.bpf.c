@@ -1207,8 +1207,7 @@ struct sendto_start {
     uint32_t payload_len;
     uint32_t pad;
     char     payload[128];   /* raw bytes for EVENT_SEND */
-    char     dns_name[128];  /* decoded name for EVENT_DNS (port 53) */
-    int      is_dns;         /* 1 if dest port == 53 */
+    int      is_dns;         /* 1 if dest port == 53; name decoded in userspace */
 };
 
 struct {
@@ -1224,46 +1223,6 @@ struct {
     __type(key, uint64_t);
     __type(value, struct sendto_start);
 } sendtos SEC(".maps");
-
-/*
- * Parse a DNS wire-format query name starting at `src` into dot-separated
- * ASCII.  Returns 0 on success, -1 if the name is malformed or overflows.
- * `out` must be at least `outsz` bytes.  Reads at most 64 bytes from src.
- */
-static __always_inline int parse_dns_name(const uint8_t *src, char *out,
-                                          uint32_t outsz)
-{
-    uint32_t si = 0, oi = 0;
-    uint8_t label_len;
-
-    /* DNS name starts at `src`; max 64 bytes to parse (verifier limit) */
-    #pragma unroll
-    for (int i = 0; i < 32; i++) {
-        if (si >= 64 || oi >= outsz - 1)
-            break;
-        if (bpf_probe_read_user(&label_len, 1, src + si))
-            return -1;
-        si++;
-        if (label_len == 0)   /* root label = end of name */
-            break;
-        if (label_len > 63)   /* compression pointer or malformed */
-            return -1;
-        if (oi > 0 && oi < outsz - 1)
-            out[oi++] = '.';
-        #pragma unroll
-        for (int j = 0; j < 63; j++) {
-            if (j >= (int)label_len) break;
-            if (si >= 128 || oi >= outsz - 1) break;
-            uint8_t ch;
-            if (bpf_probe_read_user(&ch, 1, src + si))
-                return -1;
-            out[oi++] = (char)ch;
-            si++;
-        }
-    }
-    out[oi < outsz ? oi : outsz - 1] = '\0';
-    return 0;
-}
 
 SEC("tracepoint/syscalls/sys_enter_sendto")
 int handle_sendto_enter(struct trace_event_raw_sys_enter *ctx)
@@ -1313,13 +1272,12 @@ int handle_sendto_enter(struct trace_event_raw_sys_enter *ctx)
     if (buf && len > 0)
         bpf_probe_read_user(ss->payload, len & 127, buf);
 
-    /* Decode DNS query name if destination port is 53 and there are ≥13 bytes */
-    if (ss->dport == 53 && ss->payload_len >= 13) {
-        /* DNS query: 12-byte header, then the QNAME at offset 12 */
-        const uint8_t *qname_ptr = (const uint8_t *)buf + 12;
-        if (parse_dns_name(qname_ptr, ss->dns_name, sizeof(ss->dns_name)) == 0)
-            ss->is_dns = 1;
-    }
+    /* Mark as DNS if destination port is 53; name parsing done in userspace
+     * from the raw payload to keep the BPF program within the 1M instruction
+     * verifier limit on kernel 5.15.  dns_name is left empty here; argus.c
+     * decodes it via parse_dns_payload() from ss->payload on the exit path. */
+    if (ss->dport == 53 && ss->payload_len >= 13)
+        ss->is_dns = 1;
 
     bpf_map_update_elem(&sendtos, &id, ss, BPF_ANY);
     return 0;
@@ -1362,10 +1320,9 @@ int handle_sendto_exit(struct trace_event_raw_sys_exit *ctx)
     __builtin_memcpy(e->daddr, ss->daddr, sizeof(e->daddr));
     fill_common(e, pid, comm);
 
-    if (ss->is_dns)
-        __builtin_memcpy(e->filename, ss->dns_name,  sizeof(e->filename));
-    else
-        __builtin_memcpy(e->filename, ss->payload,   sizeof(e->filename));
+    /* Always copy raw payload; for DNS, userspace decodes the name
+     * from offset 12 of the payload (QNAME in the DNS wire format). */
+    __builtin_memcpy(e->filename, ss->payload, sizeof(e->filename));
 
     bpf_ringbuf_submit(e, 0);
 
@@ -1786,6 +1743,107 @@ int BPF_PROG(lsm_socket_connect, struct socket *sock,
     char comm[16]    = {};
     bpf_get_current_comm(comm, sizeof(comm));
     return lsm_should_deny(comm, EVENT_CONNECT, uid) ? -1 : 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Syscall frequency histogram — per-(comm, syscall_nr) event counter.
+ *
+ * Userspace reads this map periodically via syscallanom_check() to detect
+ * sudden shifts in a process's syscall distribution.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+struct syscall_key {
+    char     comm[16];
+    uint32_t nr;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key,   struct syscall_key);
+    __type(value, uint64_t);
+} syscall_counts SEC(".maps");
+
+SEC("tracepoint/raw_syscalls/sys_enter")
+int handle_sys_enter(struct trace_event_raw_sys_enter *ctx)
+{
+    struct syscall_key k = {};
+    bpf_get_current_comm(k.comm, sizeof(k.comm));
+    k.nr = (uint32_t)ctx->id;
+
+    uint64_t one = 1;
+    uint64_t *cnt = bpf_map_lookup_elem(&syscall_counts, &k);
+    if (cnt)
+        __sync_fetch_and_add(cnt, 1);
+    else
+        bpf_map_update_elem(&syscall_counts, &k, &one, BPF_ANY);
+    return 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * TLS data capture — uprobe on SSL_read to capture decrypted payload.
+ *
+ * Attaches to SSL_read(ssl, buf, num) in libssl.so at runtime.
+ * The exit probe reads `num` bytes from the userspace `buf` pointer.
+ *
+ * argus.c attaches this only when --tls-data is passed.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+struct ssl_read_args {
+    uint64_t ssl;    /* SSL* (ignored) */
+    uint64_t buf;    /* void* — userspace pointer to decrypted data */
+    int      num;    /* max bytes to read */
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, uint64_t);                  /* pid_tgid */
+    __type(value, struct ssl_read_args);
+} ssl_read_scratch SEC(".maps");
+
+SEC("uprobe/SSL_read")
+int uprobe_ssl_read_enter(struct pt_regs *ctx)
+{
+    uint64_t id = bpf_get_current_pid_tgid();
+    struct ssl_read_args args = {};
+    args.buf = PT_REGS_PARM2(ctx);
+    args.num = (int)PT_REGS_PARM3(ctx);
+    bpf_map_update_elem(&ssl_read_scratch, &id, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/SSL_read")
+int uretprobe_ssl_read_exit(struct pt_regs *ctx)
+{
+    uint64_t id  = bpf_get_current_pid_tgid();
+    uint32_t pid = id >> 32;
+    int      ret = (int)PT_REGS_RC(ctx);
+    if (ret <= 0) {
+        bpf_map_delete_elem(&ssl_read_scratch, &id);
+        return 0;
+    }
+
+    struct ssl_read_args *args = bpf_map_lookup_elem(&ssl_read_scratch, &id);
+    if (!args) return 0;
+
+    char comm[16] = {};
+    bpf_get_current_comm(comm, sizeof(comm));
+
+    event_t *e = bpf_ringbuf_reserve(&rb, sizeof(event_t), 0);
+    if (!e) { note_drop(); bpf_map_delete_elem(&ssl_read_scratch, &id); return 0; }
+    __builtin_memset(e, 0, sizeof(*e));
+    fill_common(e, pid, comm);
+    e->type = EVENT_TLS_DATA;
+
+    uint32_t cap = (uint32_t)ret;
+    if (cap > sizeof(e->tls_payload)) cap = sizeof(e->tls_payload);
+    e->tls_payload_len = cap;
+    bpf_probe_read_user(e->tls_payload, cap, (void *)(uintptr_t)args->buf);
+
+    bpf_ringbuf_submit(e, 0);
+    bpf_map_delete_elem(&ssl_read_scratch, &id);
+    return 0;
 }
 
 char LICENSE[] SEC("license") = "GPL";

@@ -35,6 +35,7 @@
 #include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <pthread.h>
 
 #define DEFAULT_PORT    9000
 #define MAX_CLIENTS     64
@@ -226,7 +227,11 @@ typedef struct {
     char   remote_ip[INET6_ADDRSTRLEN];
     char   buf[LINE_BUF_SZ];
     int    buf_len;
-    uint64_t lines;     /* lines received from this client */
+    uint64_t lines;        /* lines received from this client */
+    time_t   connected_at; /* unix timestamp of connect       */
+    time_t   last_hb;      /* unix timestamp of last HEARTBEAT */
+    char     version[32];  /* agent version from HEARTBEAT    */
+    uint64_t agent_uptime; /* agent uptime_secs from HEARTBEAT */
 } client_t;
 
 /* ── globals ─────────────────────────────────────────────────────────────── */
@@ -317,6 +322,10 @@ static void accept_client(int listen_fd)
                   c->remote_ip, sizeof(c->remote_ip));
     }
 
+    c->connected_at = time(NULL);
+    c->last_hb      = 0;
+    c->version[0]   = '\0';
+    c->agent_uptime = 0;
     g_nclients++;
     fprintf(stderr, "info: client connected from %s (fd=%d, total=%d)\n",
             c->remote_ip, fd, g_nclients);
@@ -350,6 +359,24 @@ static void read_client(client_t *c)
             emit_with_host(start, c->remote_ip);
             c->lines++;
             g_total_lines++;
+
+            /* Heartbeat tracking — parse HEARTBEAT events to update agent state */
+            if (strstr(start, "\"type\":\"HEARTBEAT\"")) {
+                c->last_hb = time(NULL);
+                const char *vp = strstr(start, "\"version\":\"");
+                if (vp) {
+                    vp += 11;
+                    const char *ve = strchr(vp, '"');
+                    if (ve) {
+                        size_t vl = (size_t)(ve - vp);
+                        if (vl >= sizeof(c->version)) vl = sizeof(c->version) - 1;
+                        memcpy(c->version, vp, vl);
+                        c->version[vl] = '\0';
+                    }
+                }
+                const char *up = strstr(start, "\"uptime_secs\":");
+                if (up) c->agent_uptime = (uint64_t)strtoull(up + 14, NULL, 10);
+            }
 
             /* Fleet correlation */
             char corr_key[CORR_KEY_SZ];
@@ -392,8 +419,103 @@ static void usage(const char *prog)
         "  --stats-interval      <secs>  Print connection stats every N seconds (0=off)\n"
         "  --correlate-window    <secs>  Fleet correlation time window (default: 60)\n"
         "  --correlate-threshold <N>     Distinct hosts to trigger fleet alert (default: 3)\n"
+        "  --mgmt-port           <N>     Management HTTP API port on 127.0.0.1 (0=off)\n"
+        "                                  GET /agents — connected sensor health\n"
+        "                                  GET /stats  — server statistics\n"
         "  --help                        Show this message\n",
         prog, DEFAULT_PORT);
+}
+
+/* ── management HTTP server (/agents endpoint) ───────────────────────────── */
+
+static int g_mgmt_port = 0;
+static time_t g_start_time = 0;
+
+static void *mgmt_server_thread(void *arg)
+{
+    (void)arg;
+    int srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) return NULL;
+    int one = 1;
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in a = {};
+    a.sin_family      = AF_INET;
+    a.sin_port        = htons((uint16_t)g_mgmt_port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(srv, (struct sockaddr *)&a, sizeof(a)) < 0 ||
+        listen(srv, 4) < 0) { close(srv); return NULL; }
+
+    fprintf(stderr, "info: management API on 127.0.0.1:%d\n", g_mgmt_port);
+
+    while (g_running) {
+        struct timeval tv = {1, 0};
+        fd_set rs; FD_ZERO(&rs); FD_SET(srv, &rs);
+        if (select(srv + 1, &rs, NULL, NULL, &tv) <= 0) continue;
+        int cl = accept(srv, NULL, NULL);
+        if (cl < 0) continue;
+
+        /* Read request line (just need to know if /agents or /stats) */
+        char req[512] = {};
+        recv(cl, req, sizeof(req) - 1, 0);
+
+        char body[8192] = {};
+        time_t now = time(NULL);
+
+        if (strstr(req, "GET /agents")) {
+            /* JSON array of connected agent summaries */
+            size_t pos = 0;
+            pos += (size_t)snprintf(body + pos, sizeof(body) - pos, "[");
+            int first = 1;
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                if (g_clients[i].fd < 0) continue;
+                client_t *c = &g_clients[i];
+                long secs_since_hb = c->last_hb ? (long)(now - c->last_hb) : -1;
+                const char *status = (secs_since_hb < 0)   ? "new"
+                                   : (secs_since_hb < 90)  ? "healthy"
+                                   : (secs_since_hb < 300) ? "stale"
+                                                            : "missing";
+                pos += (size_t)snprintf(body + pos, sizeof(body) - pos,
+                    "%s{\"ip\":\"%s\",\"version\":\"%s\","
+                    "\"uptime_secs\":%llu,\"connected_secs\":%ld,"
+                    "\"lines\":%llu,\"last_heartbeat_secs\":%ld,"
+                    "\"status\":\"%s\"}",
+                    first ? "" : ",",
+                    c->remote_ip,
+                    c->version[0] ? c->version : "unknown",
+                    (unsigned long long)c->agent_uptime,
+                    (long)(now - c->connected_at),
+                    (unsigned long long)c->lines,
+                    secs_since_hb,
+                    status);
+                first = 0;
+            }
+            snprintf(body + pos, sizeof(body) - pos, "]");
+        } else if (strstr(req, "GET /stats")) {
+            snprintf(body, sizeof(body),
+                "{\"agents\":%d,\"total_lines\":%llu,"
+                "\"uptime_secs\":%ld,\"corr_window\":%d,"
+                "\"corr_threshold\":%d}",
+                g_nclients,
+                (unsigned long long)g_total_lines,
+                (long)(now - g_start_time),
+                g_corr_window, g_corr_threshold);
+        } else {
+            const char *r404 = "HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            send(cl, r404, strlen(r404), 0);
+            close(cl);
+            continue;
+        }
+
+        char hdr[256];
+        snprintf(hdr, sizeof(hdr),
+            "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
+            "Content-Length: %zu\r\nConnection: close\r\n\r\n", strlen(body));
+        send(cl, hdr,  strlen(hdr),  0);
+        send(cl, body, strlen(body), 0);
+        close(cl);
+    }
+    close(srv);
+    return NULL;
 }
 
 /* ── main ────────────────────────────────────────────────────────────────── */
@@ -410,18 +532,20 @@ int main(int argc, char **argv)
         {"stats-interval",      required_argument, 0, 's'},
         {"correlate-window",    required_argument, 0, 'w'},
         {"correlate-threshold", required_argument, 0, 'c'},
+        {"mgmt-port",           required_argument, 0, 'm'},
         {"help",                no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:o:s:w:c:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:o:s:w:c:m:h", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'p': port = atoi(optarg); break;
         case 'o': strncpy(output_path, optarg, sizeof(output_path) - 1); break;
         case 's': stats_interval = atoi(optarg); break;
         case 'w': g_corr_window    = atoi(optarg); break;
         case 'c': g_corr_threshold = atoi(optarg); break;
+        case 'm': g_mgmt_port      = atoi(optarg); break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 1;
         }
@@ -468,6 +592,13 @@ int main(int argc, char **argv)
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
     signal(SIGPIPE, SIG_IGN);
+
+    g_start_time = time(NULL);
+    if (g_mgmt_port > 0) {
+        pthread_t mt;
+        pthread_create(&mt, NULL, mgmt_server_thread, NULL);
+        pthread_detach(mt);
+    }
 
     fprintf(stderr, "info: argus-server listening on port %d\n", port);
 

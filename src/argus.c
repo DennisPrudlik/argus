@@ -6,6 +6,7 @@
 #include <getopt.h>
 #include <pwd.h>
 #include <grp.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <bpf/libbpf.h>
@@ -30,6 +31,16 @@
 #include "beacon.h"
 #include "seqdetect.h"
 #include "yara_scan.h"
+#include "mitre.h"
+#include "webhook.h"
+#include "exechash.h"
+#include "isolate.h"
+#include "memforensics.h"
+#include "store.h"
+#include "iocenrich.h"
+#include "container.h"
+#include "compliance.h"
+#include "syscallanom.h"
 
 static volatile int running       = 1;
 static volatile int reload_config = 0;
@@ -124,6 +135,37 @@ static double dns_entropy(const char *s)
         h += p * lp;
     }
     return h;
+}
+
+/*
+ * Decode a DNS QNAME from the raw sendto payload stored in filename.
+ * DNS wire format: 12-byte header, then labels.  Each label is a length byte
+ * followed by that many characters.  Root label = 0x00.
+ * Writes the decoded name into out[outsz].  Returns 0 on success, -1 on error.
+ */
+static int parse_dns_payload(const uint8_t *payload, uint32_t payload_len,
+                              char *out, size_t outsz)
+{
+    if (payload_len < 13 || outsz < 2)
+        return -1;
+
+    const uint8_t *p   = payload + 12;   /* QNAME starts at offset 12 */
+    const uint8_t *end = payload + payload_len;
+    size_t oi = 0;
+
+    while (p < end) {
+        uint8_t label_len = *p++;
+        if (label_len == 0)
+            break;                        /* root label — end of name */
+        if (label_len > 63 || p + label_len > end)
+            return -1;                    /* compression ptr or malformed */
+        if (oi > 0 && oi < outsz - 1)
+            out[oi++] = '.';
+        for (uint8_t j = 0; j < label_len && oi < outsz - 1; j++)
+            out[oi++] = (char)*p++;
+    }
+    out[oi < outsz ? oi : outsz - 1] = '\0';
+    return (oi > 0) ? 0 : -1;
 }
 
 static void dga_check(const event_t *e, const argus_cfg_t *cfg)
@@ -224,7 +266,28 @@ static void usage(const char *prog)
         "  --json                         Newline-delimited JSON output\n"
         "  --config-check                 Validate config file(s) and print settings, then exit\n"
         "  --version                      Print version and exit\n"
-        "  --help                         Show this message\n",
+        "  --help                         Show this message\n"
+        "\n"
+        "Enterprise / detection options:\n"
+        "  --canary          <path>       Honeypot file to monitor (repeat for multiple)\n"
+        "  --alert-dedup     <secs>       Suppress duplicate alerts within N seconds\n"
+        "  --beacon-cv       <0.0-1.0>   C2 beaconing detection CV threshold (e.g. 0.15)\n"
+        "  --lsm-deny                     Enforce kernel_rules via BPF LSM hooks\n"
+        "  --yara-rules      <dir>        Directory of .yar rule files for in-process scanning\n"
+        "  --mitre-tags                   Add MITRE ATT&CK technique IDs to JSON output\n"
+        "  --webhook         <url>        POST JSON alerts to this URL (SOAR integration)\n"
+        "  --exec-hash                    Compute SHA-256 of every executed binary\n"
+        "  --vt-api-key      <key>        VirusTotal API key for hash/IP/domain enrichment\n"
+        "  --otx-api-key     <key>        AlienVault OTX API key for IOC enrichment\n"
+        "  --response-isolate             Block source IPs via iptables on rule match\n"
+        "  --store-path      <path>       SQLite3 DB path for persistent event store\n"
+        "  --store-query-port <port>      HTTP query API port for the event store\n"
+        "  --container-enrich             Resolve cgroup to container/pod name (Docker/K8s)\n"
+        "  --compliance      <framework>  Compliance framework: cis, pci-dss, nist, soc2\n"
+        "  --compliance-report <path>     Write HTML compliance report to path on exit\n"
+        "  --syscall-anom    <secs>       Check syscall frequency anomalies every N seconds\n"
+        "  --tls-data                     Capture decrypted TLS data via SSL_read uprobe\n"
+        "  --mem-forensics                Snapshot anonymous executable mappings on exec\n",
         prog);
 }
 
@@ -304,7 +367,8 @@ static int bpf_lsm_supported(void)
 }
 
 static void configure_programs(struct argus_bpf *skel, int event_mask,
-                               int follow_pid, int lsm_deny)
+                               int follow_pid, int lsm_deny,
+                               int tls_data_enable, int syscall_anom_interval)
 {
     /* 0 means trace-all (same convention as print_header / event_matches) */
     if (!event_mask) event_mask = TRACE_ALL;
@@ -362,6 +426,16 @@ static void configure_programs(struct argus_bpf *skel, int event_mask,
         bpf_program__set_autoload(skel->progs.lsm_bprm_check,     false);
         bpf_program__set_autoload(skel->progs.lsm_socket_connect,  false);
     }
+
+    /* TLS data capture (SSL_read uprobe) — only when --tls-data is set */
+    if (!tls_data_enable) {
+        bpf_program__set_autoload(skel->progs.uprobe_ssl_read_enter,   false);
+        bpf_program__set_autoload(skel->progs.uretprobe_ssl_read_exit, false);
+    }
+
+    /* Syscall frequency histogram — only when --syscall-anom is set */
+    if (!syscall_anom_interval)
+        bpf_program__set_autoload(skel->progs.handle_sys_enter, false);
 }
 
 /* ── event handler ──────────────────────────────────────────────────────── */
@@ -388,6 +462,21 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
                     sizeof(resolved_event.filename) - 1);
             ev = &resolved_event;
         }
+    }
+
+    /* ── DNS: decode query name from raw payload (BPF sends raw bytes) ── */
+    event_t dns_decoded;
+    if (ev->type == EVENT_DNS && ev->filename[0] != '\0' &&
+        (unsigned char)ev->filename[0] <= 63) {
+        /* filename holds raw DNS payload bytes — decode the QNAME */
+        dns_decoded = *ev;
+        if (parse_dns_payload((const uint8_t *)ev->filename,
+                              (uint32_t)ev->mode > 0 ? (uint32_t)ev->mode : 128,
+                              dns_decoded.filename,
+                              sizeof(dns_decoded.filename)) != 0) {
+            /* Decoding failed — leave filename as-is (may be pre-decoded) */
+        }
+        ev = &dns_decoded;
     }
 
     /* ── DNS correlation cache update ────────────────────────────────── */
@@ -419,6 +508,19 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
     /* ── LD_PRELOAD env check on exec ────────────────────────────────── */
     if (ev->type == EVENT_EXEC)
         ldpreload_check(ev);
+
+    /* ── File hash enrichment on exec ────────────────────────────────── */
+    if (ev->type == EVENT_EXEC && g_cfg && g_cfg->exec_hash)
+        exechash_check(ev);
+
+    /* ── Memory forensics on memfd exec / suspicious exec ───────────── */
+    if (g_cfg && g_cfg->mem_forensics)
+        memforensics_check(ev);
+
+    /* ── IOC enrichment on CONNECT / DNS / EXEC ─────────────────────── */
+    if (ev->type == EVENT_CONNECT || ev->type == EVENT_DNS ||
+        ev->type == EVENT_EXEC)
+        iocenrich_check(ev);
 
     /* ── FIM check on file close-after-write ──────────────────────────── */
     if (ev->type == EVENT_WRITE_CLOSE)
@@ -479,6 +581,12 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
         baseline_learn(ev);
     else
         baseline_check(ev);
+
+    /* ── Persistent event store ──────────────────────────────────────── */
+    store_event(ev);
+
+    /* ── Compliance event recording ──────────────────────────────────── */
+    compliance_record_event(ev);
 
     /* Update lineage regardless of filter so the tree stays consistent */
     if (ev->type == EVENT_EXEC)
@@ -549,6 +657,21 @@ int main(int argc, char **argv)
         {"beacon-cv",       required_argument, 0, 1002},
         {"lsm-deny",        no_argument,       0, 1003},
         {"yara-rules",      required_argument, 0, 1004},
+        /* ── enterprise feature options ── */
+        {"mitre-tags",      no_argument,       0, 1010},
+        {"webhook",         required_argument, 0, 1011},
+        {"exec-hash",       no_argument,       0, 1012},
+        {"vt-api-key",      required_argument, 0, 1013},
+        {"otx-api-key",     required_argument, 0, 1014},
+        {"response-isolate",no_argument,       0, 1015},
+        {"store-path",      required_argument, 0, 1016},
+        {"store-query-port",required_argument, 0, 1017},
+        {"container-enrich",no_argument,       0, 1018},
+        {"compliance",      required_argument, 0, 1019},
+        {"compliance-report",required_argument,0, 1020},
+        {"syscall-anom",    required_argument, 0, 1021},
+        {"tls-data",        no_argument,       0, 1022},
+        {"mem-forensics",   no_argument,       0, 1023},
         {0, 0, 0, 0}
     };
 
@@ -631,6 +754,26 @@ int main(int argc, char **argv)
         case 1004: /* --yara-rules */
             strncpy(cfg.yara_rules_dir, optarg, sizeof(cfg.yara_rules_dir) - 1);
             break;
+        case 1010: cfg.mitre_tags         = 1;                                                       break;
+        case 1011: strncpy(cfg.webhook_url, optarg, sizeof(cfg.webhook_url) - 1);                   break;
+        case 1012: cfg.exec_hash          = 1;                                                       break;
+        case 1013: strncpy(cfg.vt_api_key,  optarg, sizeof(cfg.vt_api_key)  - 1);                  break;
+        case 1014: strncpy(cfg.otx_api_key, optarg, sizeof(cfg.otx_api_key) - 1);                  break;
+        case 1015: cfg.response_isolate   = 1;                                                       break;
+        case 1016: strncpy(cfg.store_path, optarg, sizeof(cfg.store_path)   - 1);                   break;
+        case 1017: cfg.store_query_port   = atoi(optarg);                                            break;
+        case 1018: cfg.container_enrich   = 1;                                                       break;
+        case 1019:
+            if      (strcmp(optarg, "cis")     == 0) cfg.compliance_framework = COMPLIANCE_CIS_LINUX;
+            else if (strcmp(optarg, "pci-dss") == 0) cfg.compliance_framework = COMPLIANCE_PCI_DSS;
+            else if (strcmp(optarg, "nist")    == 0) cfg.compliance_framework = COMPLIANCE_NIST_CSF;
+            else if (strcmp(optarg, "soc2")    == 0) cfg.compliance_framework = COMPLIANCE_SOC2;
+            else { fprintf(stderr, "error: unknown --compliance framework '%s' (cis,pci-dss,nist,soc2)\n", optarg); return 1; }
+            break;
+        case 1020: strncpy(cfg.compliance_report, optarg, sizeof(cfg.compliance_report) - 1);       break;
+        case 1021: cfg.syscall_anom_interval = atoi(optarg);                                         break;
+        case 1022: cfg.tls_data_enable     = 1;                                                      break;
+        case 1023: cfg.mem_forensics       = 1;                                                      break;
         default:  usage(argv[0]); return 1;
         }
     }
@@ -833,7 +976,8 @@ int main(int argc, char **argv)
 
     bpf_map__set_max_entries(skel->maps.rb,
                              (uint32_t)cfg.ring_buffer_kb * 1024);
-    configure_programs(skel, cfg.filter.event_mask, cfg.follow_pid, cfg.lsm_deny);
+    configure_programs(skel, cfg.filter.event_mask, cfg.follow_pid, cfg.lsm_deny,
+                       cfg.tls_data_enable, cfg.syscall_anom_interval);
 
     err = argus_bpf__load(skel);
     if (err) {
@@ -906,6 +1050,45 @@ int main(int argc, char **argv)
             fprintf(stderr, "warning: --yara-rules specified but argus "
                             "was built without libyara support\n");
     }
+
+    /* Initialise MITRE ATT&CK tagging (no-op init — just records config) */
+    (void)cfg.mitre_tags;   /* used in handle_event via g_cfg */
+
+    /* Initialise webhook/SOAR integration */
+    if (cfg.webhook_url[0])
+        webhook_init(cfg.webhook_url);
+
+    /* Initialise exec file-hash enrichment */
+    if (cfg.exec_hash)
+        exechash_init(cfg.vt_api_key[0] ? cfg.vt_api_key : NULL);
+
+    /* Initialise network isolation response */
+    isolate_init(0 /* not dry-run */);
+
+    /* Initialise memory forensics */
+    if (cfg.mem_forensics)
+        memforensics_init();
+
+    /* Initialise persistent event store */
+    if (cfg.store_path[0])
+        store_init(cfg.store_path, cfg.store_query_port);
+
+    /* Initialise IOC enrichment */
+    if (cfg.vt_api_key[0] || cfg.otx_api_key[0])
+        iocenrich_init(cfg.vt_api_key[0]  ? cfg.vt_api_key  : NULL,
+                       cfg.otx_api_key[0] ? cfg.otx_api_key : NULL);
+
+    /* Initialise container enrichment */
+    if (cfg.container_enrich)
+        container_init();
+
+    /* Initialise compliance reporting */
+    if (cfg.compliance_report[0])
+        compliance_init(cfg.compliance_framework, cfg.compliance_report);
+
+    /* Initialise syscall frequency anomaly detection */
+    if (cfg.syscall_anom_interval > 0)
+        syscallanom_init(cfg.syscall_anom_interval);
 
     /* LSM enforcement status */
     if (cfg.lsm_deny) {
@@ -1005,6 +1188,10 @@ int main(int argc, char **argv)
             if (delta) forward_drops(delta);
             forward_tick();
         }
+
+        /* ── Periodic syscall anomaly check ────────────────────────── */
+        if (cfg.syscall_anom_interval > 0)
+            syscallanom_check(skel);
     }
 
     /* Final drop check before exit */
@@ -1028,6 +1215,15 @@ cleanup:
     threatintel_free();
     if (forwarding)
         forward_fini();
+    if (cfg.webhook_url[0])
+        webhook_destroy();
+    iocenrich_destroy();
+    store_destroy();
+    if (cfg.compliance_report[0]) {
+        compliance_write_report();
+        compliance_destroy();
+    }
+    isolate_unblock_all();
     if (output_file)
         fclose(output_file);
     if (cfg.pid_file[0])

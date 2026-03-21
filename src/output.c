@@ -326,6 +326,12 @@ static void text_event(const event_t *e)
     case EVENT_NS_ESCAPE:
         fprintf(OUT, "flags=0x%x", e->mode);
         break;
+    case EVENT_TLS_DATA:
+        fprintf(OUT, "tls_len=%u", e->tls_payload_len);
+        break;
+    case EVENT_HEARTBEAT:
+        fprintf(OUT, "liveness");
+        break;
     }
     fputc('\n', OUT);
 }
@@ -377,6 +383,8 @@ static void json_event(const event_t *e)
         [EVENT_TLS_SNI]     = "TLS_SNI",
         [EVENT_PROC_SCRAPE] = "PROC_SCRAPE",
         [EVENT_NS_ESCAPE]   = "NS_ESCAPE",
+        [EVENT_TLS_DATA]    = "TLS_DATA",
+        [EVENT_HEARTBEAT]   = "HEARTBEAT",
     };
 
     char chain[LINEAGE_BUF];
@@ -513,6 +521,11 @@ static void json_event(const event_t *e)
     case EVENT_NS_ESCAPE:
         fprintf(OUT, ",\"ns_flags\":\"0x%x\"", e->mode);
         break;
+    case EVENT_TLS_DATA:
+        fprintf(OUT, ",\"tls_payload_len\":%u", e->tls_payload_len);
+        break;
+    case EVENT_HEARTBEAT:
+        break;
     }
     fputs("}\n", OUT);
 }
@@ -532,14 +545,15 @@ static void syslog_event(const event_t *e)
         [EVENT_KMOD_LOAD]   = "KMOD_LOAD",   [EVENT_NET_CORR]    = "NET_CORR",
         [EVENT_RATE_LIMIT]  = "RATE_LIMIT",  [EVENT_THREAT_INTEL]= "THREAT_INTEL",
         [EVENT_TLS_SNI]     = "TLS_SNI",     [EVENT_PROC_SCRAPE] = "PROC_SCRAPE",
-        [EVENT_NS_ESCAPE]   = "NS_ESCAPE",
+        [EVENT_NS_ESCAPE]   = "NS_ESCAPE",   [EVENT_TLS_DATA]    = "TLS_DATA",
+        [EVENT_HEARTBEAT]   = "HEARTBEAT",
     };
 
     char chain[LINEAGE_BUF];
     lineage_str(e->ppid, chain, sizeof(chain));
 
     const char *ts = (e->type < EVENT_TYPE_MAX) ? type_str[e->type] : "UNKNOWN";
-    char detail[256] = {};
+    char detail[512] = {};
 
     switch (e->type) {
     case EVENT_EXEC:
@@ -656,6 +670,12 @@ static void syslog_event(const event_t *e)
     case EVENT_NS_ESCAPE:
         snprintf(detail, sizeof(detail), "ns_flags=0x%x", e->mode);
         break;
+    case EVENT_TLS_DATA:
+        snprintf(detail, sizeof(detail), "tls_len=%u", e->tls_payload_len);
+        break;
+    case EVENT_HEARTBEAT:
+        snprintf(detail, sizeof(detail), "liveness");
+        break;
     }
 
     syslog(LOG_INFO,
@@ -715,6 +735,8 @@ static void cef_event(const event_t *e)
         [EVENT_TLS_SNI]     = {"TLS_SNI",      "TLS SNI Observed",         3},
         [EVENT_PROC_SCRAPE] = {"PROC_SCRAPE",  "Proc Scraping Detected",   8},
         [EVENT_NS_ESCAPE]   = {"NS_ESCAPE",    "Namespace Escape",         9},
+        [EVENT_TLS_DATA]    = {"TLS_DATA",     "Decrypted TLS Data",       3},
+        [EVENT_HEARTBEAT]   = {"HEARTBEAT",    "Agent Liveness Ping",      0},
     };
 
     if (e->type >= EVENT_TYPE_MAX) return;
@@ -860,6 +882,11 @@ static void cef_event(const event_t *e)
         break;
     case EVENT_NS_ESCAPE:
         fprintf(OUT, " cs2Label=ns_flags cs2=0x%x", e->mode);
+        break;
+    case EVENT_TLS_DATA:
+        fprintf(OUT, " cn1Label=tls_len cn1=%u", e->tls_payload_len);
+        break;
+    case EVENT_HEARTBEAT:
         break;
     }
     fputc('\n', OUT);

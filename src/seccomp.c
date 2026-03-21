@@ -3,6 +3,7 @@
 #ifdef __linux__
 #include <stddef.h>          /* offsetof */
 #include <errno.h>
+#include <unistd.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <linux/filter.h>

@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include "output.h"
 #include "canary.h"
+#include "compliance.h"
 
 /*
  * Full runtime configuration for argus.
@@ -83,6 +84,40 @@ typedef struct {
 
     /* ── LSM BPF enforcement ─────────────────────────────────────────────── */
     int          lsm_deny;            /* 1 = enforce kernel_rules via LSM hooks  */
+
+    /* ── MITRE ATT&CK tagging ────────────────────────────────────────────── */
+    int          mitre_tags;          /* 1 = add mitre_id/name/tactic to JSON    */
+
+    /* ── Webhook / SOAR integration ─────────────────────────────────────── */
+    char         webhook_url[512];    /* "" = off; else POST alerts here         */
+
+    /* ── File hash enrichment ────────────────────────────────────────────── */
+    int          exec_hash;           /* 1 = SHA-256 every EXEC binary           */
+    char         vt_api_key[64];      /* VirusTotal API key (empty = off)        */
+    char         otx_api_key[64];     /* AlienVault OTX API key (empty = off)    */
+
+    /* ── Network isolation ───────────────────────────────────────────────── */
+    int          response_isolate;    /* 1 = enable iptables isolation action    */
+
+    /* ── Persistent event store ─────────────────────────────────────────── */
+    char         store_path[256];     /* "" = off; else SQLite DB path           */
+    int          store_query_port;    /* 0 = off; N = HTTP query API port        */
+
+    /* ── Container enrichment ───────────────────────────────────────────── */
+    int          container_enrich;    /* 1 = resolve cgroup to container info    */
+
+    /* ── Compliance reporting ────────────────────────────────────────────── */
+    compliance_framework_t compliance_framework;
+    char         compliance_report[256]; /* "" = off; else write report to path */
+
+    /* ── Syscall anomaly detection ───────────────────────────────────────── */
+    int          syscall_anom_interval; /* 0 = off; N = check every N seconds   */
+
+    /* ── TLS data capture ────────────────────────────────────────────────── */
+    int          tls_data_enable;     /* 1 = attach uprobe on SSL_read           */
+
+    /* ── Memory forensics ────────────────────────────────────────────────── */
+    int          mem_forensics;       /* 1 = snapshot anon mappings on MEMEXEC   */
 } argus_cfg_t;
 
 /* Fill cfg with safe defaults (no filters, 256KB ring buffer, no summary) */

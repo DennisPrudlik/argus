@@ -282,7 +282,7 @@ static void expand_message(const rule_t *r, const event_t *e,
         if (varlen < sizeof(var))
             memcpy(var, src + 1, varlen);
 
-        char val[128] = {};
+        char val[256] = {};
         if      (strcmp(var, "comm")       == 0) snprintf(val, sizeof(val), "%s",  e->comm);
         else if (strcmp(var, "pid")        == 0) snprintf(val, sizeof(val), "%d",  e->pid);
         else if (strcmp(var, "ppid")       == 0) snprintf(val, sizeof(val), "%d",  e->ppid);

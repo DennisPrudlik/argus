@@ -353,6 +353,46 @@ int cfg_load(const char *path, argus_cfg_t *cfg)
         else if (strcmp(key, "lsm_deny") == 0) {
             int v = 0; p = parse_bool(p, &v); cfg->lsm_deny = v;
         }
+        else if (strcmp(key, "mitre_tags") == 0) {
+            int v = 0; p = parse_bool(p, &v); cfg->mitre_tags = v;
+        }
+        else if (strcmp(key, "webhook_url") == 0)
+            p = parse_str(p, cfg->webhook_url, sizeof(cfg->webhook_url));
+        else if (strcmp(key, "exec_hash") == 0) {
+            int v = 0; p = parse_bool(p, &v); cfg->exec_hash = v;
+        }
+        else if (strcmp(key, "vt_api_key") == 0)
+            p = parse_str(p, cfg->vt_api_key, sizeof(cfg->vt_api_key));
+        else if (strcmp(key, "otx_api_key") == 0)
+            p = parse_str(p, cfg->otx_api_key, sizeof(cfg->otx_api_key));
+        else if (strcmp(key, "response_isolate") == 0) {
+            int v = 0; p = parse_bool(p, &v); cfg->response_isolate = v;
+        }
+        else if (strcmp(key, "store_path") == 0)
+            p = parse_str(p, cfg->store_path, sizeof(cfg->store_path));
+        else if (strcmp(key, "store_query_port") == 0)
+            p = parse_int(p, &cfg->store_query_port);
+        else if (strcmp(key, "container_enrich") == 0) {
+            int v = 0; p = parse_bool(p, &v); cfg->container_enrich = v;
+        }
+        else if (strcmp(key, "compliance_framework") == 0) {
+            char fw[32] = {};
+            p = parse_str(p, fw, sizeof(fw));
+            if      (strcmp(fw, "cis")     == 0) cfg->compliance_framework = COMPLIANCE_CIS_LINUX;
+            else if (strcmp(fw, "pci-dss") == 0) cfg->compliance_framework = COMPLIANCE_PCI_DSS;
+            else if (strcmp(fw, "nist")    == 0) cfg->compliance_framework = COMPLIANCE_NIST_CSF;
+            else if (strcmp(fw, "soc2")    == 0) cfg->compliance_framework = COMPLIANCE_SOC2;
+        }
+        else if (strcmp(key, "compliance_report") == 0)
+            p = parse_str(p, cfg->compliance_report, sizeof(cfg->compliance_report));
+        else if (strcmp(key, "syscall_anom_interval") == 0)
+            p = parse_int(p, &cfg->syscall_anom_interval);
+        else if (strcmp(key, "tls_data_enable") == 0) {
+            int v = 0; p = parse_bool(p, &v); cfg->tls_data_enable = v;
+        }
+        else if (strcmp(key, "mem_forensics") == 0) {
+            int v = 0; p = parse_bool(p, &v); cfg->mem_forensics = v;
+        }
 
         /* advance past current value to next key */
         while (*p && *p != ',' && *p != '}') p++;

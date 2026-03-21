@@ -26,6 +26,14 @@ else
 YARA_LIBS :=
 endif
 
+# Optional SQLite3 — used for persistent event store
+SQLITE_LIBS := $(shell pkg-config --libs sqlite3 2>/dev/null)
+ifneq ($(SQLITE_LIBS),)
+CFLAGS += -DHAVE_SQLITE3 $(shell pkg-config --cflags sqlite3 2>/dev/null)
+else
+SQLITE_LIBS :=
+endif
+
 # Seccomp — present on Linux kernels; gracefully absent on non-Linux
 HAVE_SECCOMP := $(shell test -f /usr/include/linux/seccomp.h && echo yes)
 # (seccomp.c guards itself with #ifdef __linux__ so no extra CFLAGS needed)
@@ -62,7 +70,10 @@ ARGUS_SRCS = \
     $(SRC)/rules.c $(SRC)/forward.c $(SRC)/dns.c $(SRC)/baseline.c \
     $(SRC)/seccomp.c $(SRC)/metrics.c $(SRC)/fim.c $(SRC)/ldpreload.c \
     $(SRC)/threatintel.c $(SRC)/canary.c $(SRC)/dedup.c $(SRC)/hollow.c \
-    $(SRC)/beacon.c $(SRC)/seqdetect.c $(SRC)/yara_scan.c
+    $(SRC)/beacon.c $(SRC)/seqdetect.c $(SRC)/yara_scan.c \
+    $(SRC)/mitre.c $(SRC)/webhook.c $(SRC)/exechash.c $(SRC)/isolate.c \
+    $(SRC)/memforensics.c $(SRC)/store.c $(SRC)/iocenrich.c \
+    $(SRC)/container.c $(SRC)/compliance.c $(SRC)/syscallanom.c
 
 ARGUS_HDRS = \
     $(SRC)/argus.h $(SRC)/output.h $(SRC)/lineage.h $(SRC)/config.h \
@@ -70,15 +81,19 @@ ARGUS_HDRS = \
     $(SRC)/seccomp.h $(SRC)/metrics.h $(SRC)/fim.h $(SRC)/ldpreload.h \
     $(SRC)/threatintel.h $(SRC)/canary.h $(SRC)/dedup.h $(SRC)/hollow.h \
     $(SRC)/beacon.h $(SRC)/seqdetect.h $(SRC)/yara_scan.h \
+    $(SRC)/mitre.h $(SRC)/webhook.h $(SRC)/exechash.h $(SRC)/isolate.h \
+    $(SRC)/memforensics.h $(SRC)/store.h $(SRC)/iocenrich.h \
+    $(SRC)/container.h $(SRC)/compliance.h $(SRC)/syscallanom.h \
     $(BPF_SRC)/argus.skel.h
 
 argus: $(ARGUS_SRCS) $(ARGUS_HDRS)
 	$(CC) $(CFLAGS) -o $@ $(ARGUS_SRCS) \
-	    -lbpf -lelf -lz -lpthread -lm $(OPENSSL_LIBS) $(YARA_LIBS)
+	    -lbpf -lelf -lz -lpthread -lm \
+	    $(OPENSSL_LIBS) $(YARA_LIBS) $(SQLITE_LIBS)
 
 # 5. Fleet aggregator — no BPF dependency
 argus-server: $(SRC)/argus-server.c $(SRC)/argus.h
-	$(CC) $(CFLAGS) -o $@ $(SRC)/argus-server.c
+	$(CC) $(CFLAGS) -o $@ $(SRC)/argus-server.c -lpthread
 
 # ── unit tests (no BPF, no root) ──────────────────────────────────────────────
 

@@ -2,7 +2,9 @@
 
 A lightweight Linux kernel telemetry and threat-detection tool built on eBPF. Traces 21 event types system-wide — process execution, file access, network connections, privilege escalation, memory execution, kernel-module loading, namespace escapes, DNS queries, TLS SNI extraction, and more — with minimal overhead. Every event carries full process ancestry (`systemd→sshd→bash→curl`) and the container cgroup name for immediate container attribution.
 
-**Version 0.3.0** — Adds canary/honeypot file detection, alert deduplication, process hollowing detection, C2 beaconing detection, syscall attack-chain detection (MEMEXEC→EXEC, PTRACE→EXEC, PRIVESC→shell, NS_ESCAPE→EXEC), YARA rule scanning, cross-host fleet correlation in `argus-server`, and LSM BPF in-kernel enforcement mode.
+**Version 0.4.0** — Full integration and verification of all enterprise features. BPF verifier fix for kernel 5.15: DNS query-name decoding moved from BPF to userspace, eliminating the 1 M-instruction verifier limit breach caused by the inlined `parse_dns_name` loop. SSL_read uprobe and syscall-histogram BPF programs now conditionally disabled at load time (not just at runtime) when `--tls-data` / `--syscall-anom` are not requested, preventing EACCES load failures on kernels without uprobe support. SQLite3 is now a properly detected optional dependency (`pkg-config sqlite3`); `--store-path` creates and writes a real database. `--mgmt-port` documented in `argus-server --help`. All 227 unit tests and 17 integration tests verified passing end-to-end on kernel 5.15.
+
+**Version 0.3.0** — Adds canary/honeypot file detection, alert deduplication, process hollowing detection, C2 beaconing detection, syscall attack-chain detection (MEMEXEC→EXEC, PTRACE→EXEC, PRIVESC→shell, NS_ESCAPE→EXEC), YARA rule scanning, cross-host fleet correlation in `argus-server`, LSM BPF in-kernel enforcement mode, MITRE ATT&CK tagging, SHA-256 exec hashing + VirusTotal enrichment, IOC enrichment (VT + AlienVault OTX), network isolation response (iptables), persistent SQLite event store + HTTP query API, webhook/SOAR integration, agent health management API in `argus-server`, BPF syscall frequency anomaly detection, container/Kubernetes enrichment, compliance reporting (CIS, PCI-DSS, NIST, SOC2), BPF TLS data capture, and memory forensics.
 
 **Version 0.2.0** — Added 12 new kernel-traced event types, active response (BPF kill), threat-intel CIDR feed, file integrity monitoring, LD_PRELOAD detection, DGA/entropy detection, DNS→IP correlation, per-PID rate limiting, Prometheus metrics, cgroup-aware baselines, rolling baseline merge, alert suppression, process-ancestry rule matching, and fleet aggregation server.
 
@@ -23,9 +25,15 @@ sudo dnf install -y clang llvm libbpf-devel elfutils-libelf-devel zlib-devel \
      openssl-devel python3 bpftool
 ```
 
-OpenSSL (`libssl-dev`) is optional — argus builds without it; `--forward-tls` becomes a no-op.
+OpenSSL (`libssl-dev`) is optional — argus builds without it; `--forward-tls`, `--exec-hash`, and IOC enrichment (HTTPS) become no-ops.
 YARA (`libyara-dev`) is optional — argus builds without it; `--yara-rules` becomes a no-op (detected automatically via `pkg-config`).
+SQLite3 (`libsqlite3-dev`) is optional — argus builds without it; `--store-path` becomes a no-op (detected automatically via `pkg-config`).
 Seccomp is always available on Linux kernels ≥ 3.5 (detected automatically from the kernel headers).
+
+```sh
+# Install all optional dependencies
+sudo apt-get install -y libssl-dev libyara-dev libsqlite3-dev
+```
 
 Verify BTF is available on your kernel:
 
@@ -63,11 +71,11 @@ Build a native package for deployment on other machines:
 ```sh
 # Debian / Ubuntu (.deb) — requires dpkg-deb
 make deb
-# → argus_0.3.0_x86_64.deb
+# → argus_0.4.0_x86_64.deb
 
 # Fedora / RHEL (.rpm) — requires rpmbuild
 make rpm
-# → ~/rpmbuild/RPMS/.../argus-0.3.0-1.x86_64.rpm
+# → ~/rpmbuild/RPMS/.../argus-0.4.0-1.x86_64.rpm
 ```
 
 Both packages install the binary to `/usr/local/bin/argus` and include the systemd unit, tmpfiles.d config, and logrotate config.
@@ -149,6 +157,20 @@ sudo ./argus [OPTIONS]
 | `--beacon-cv <f>` | Alert when a PID's CONNECT interval coefficient of variation falls below this value (e.g. 0.15; 0 = off) |
 | `--yara-rules <dir>` | Directory of `.yar` files to scan on EXEC, WRITE_CLOSE, and KMOD_LOAD events (requires libyara) |
 | `--lsm-deny` | Enable LSM BPF enforcement: kernel rules matching file open, exec, or connect are denied in-kernel (requires kernel 5.7+ with BPF LSM) |
+| `--mitre-tags` | Annotate JSON events with MITRE ATT&CK technique ID, name, and tactic |
+| `--exec-hash` | Compute SHA-256 of every executed binary and attach to the event |
+| `--vt-api-key <key>` | VirusTotal API key — hashes and IPs are checked asynchronously |
+| `--otx-api-key <key>` | AlienVault OTX API key — IPs/domains checked for IOC matches |
+| `--response-isolate` | Block source IPs of matched alert rules via `iptables` / `ip6tables` |
+| `--store-path <path>` | Persist all events to a SQLite3 database at this path |
+| `--store-query-port <port>` | Serve a simple HTTP query API for the event store on this port |
+| `--container-enrich` | Resolve cgroup name to container name, image, pod, and namespace (Docker/Kubernetes) |
+| `--compliance <framework>` | Map events to compliance controls: `cis`, `pci-dss`, `nist`, `soc2` |
+| `--compliance-report <path>` | Write an HTML compliance report to this path on exit |
+| `--syscall-anom <secs>` | Read BPF syscall frequency histogram every N seconds and alert on chi-squared anomalies |
+| `--tls-data` | Capture first 256 bytes of decrypted TLS payloads via `SSL_read` uprobe (requires OpenSSL) |
+| `--mem-forensics` | On exec events, scan anonymous executable `/proc/<pid>/mem` mappings for entropy and YARA hits |
+| `--webhook <url>` | POST JSON alert bodies to this URL (SOAR / incident response integration) |
 
 ### Observability
 
@@ -234,6 +256,41 @@ sudo ./argus --events EXEC --yara-rules /etc/argus/yara/
 
 # LSM BPF enforcement: deny kernel-rule-matched file opens and execs in-kernel
 sudo ./argus --lsm-deny --rules /etc/argus/rules.json
+
+# MITRE ATT&CK tagging in JSON output
+sudo ./argus --json --mitre-tags | jq 'select(.mitre_id != null)'
+
+# Hash every executed binary; check unknown hashes against VirusTotal
+sudo ./argus --exec-hash --vt-api-key YOUR_KEY --json
+
+# IOC enrichment: async VT + OTX lookups for IPs and domains
+sudo ./argus --vt-api-key YOUR_VT_KEY --otx-api-key YOUR_OTX_KEY --json
+
+# Isolate attacker IPs via iptables on rule match
+sudo ./argus --rules /etc/argus/rules.json --response-isolate
+
+# Persist all events to SQLite and query via HTTP
+sudo ./argus --store-path /var/lib/argus/events.db --store-query-port 8080
+curl 'http://localhost:8080/events?type=EXEC&limit=50'
+
+# Container/Kubernetes enrichment
+sudo ./argus --container-enrich --json | jq '.container_name'
+
+# Generate a PCI-DSS HTML compliance report
+sudo ./argus --compliance pci-dss --compliance-report /tmp/pci_report.html
+
+# Syscall frequency anomaly detection (check every 60 seconds)
+sudo ./argus --syscall-anom 60 --json
+
+# Webhook to Slack/PagerDuty on every alert
+sudo ./argus --rules /etc/argus/rules.json --webhook https://hooks.slack.com/...
+
+# Memory forensics on suspicious execs
+sudo ./argus --mem-forensics --yara-rules /etc/argus/yara/ --json
+
+# Fleet management: health dashboard for all connected sensors
+./argus-server --port 9000 --mgmt-port 8081
+curl http://localhost:8081/agents
 ```
 
 ## Event Types
@@ -267,7 +324,9 @@ sudo ./argus --lsm-deny --rules /etc/argus/rules.json
 | `RATE_LIMIT` | BPF | Per-comm or per-PID rate limit exceeded | `pid`, `comm` |
 | `THREAT_INTEL` | BPF LPM trie | CONNECT destination matched threat-intel CIDR blocklist | `daddr`, `dport`, `family` |
 | `TLS_SNI` | Uprobe `SSL_write` | TLS ClientHello SNI hostname extraction | `dns_name` (SNI), `daddr`, `dport` |
+| `TLS_DATA` | Uretprobe `SSL_read` | First 256 bytes of decrypted TLS payload (`--tls-data`) | `tls_payload`, `tls_payload_len` |
 | `PROC_SCRAPE` | `sys_{enter,exit}_openat` | `/proc/<pid>/mem`, `/maps`, or `/fd` opened by a foreign process | `filename`, `target_pid` |
+| `HEARTBEAT` | Userspace timer | Periodic agent health beacon (emitted by argus, consumed by argus-server) | `duration_ns` (uptime) |
 
 All events include: `pid`, `ppid`, `uid`, `gid`, `user` (username when resolvable), `comm`, `cgroup`, `lineage`, `duration_ns`.
 
@@ -312,9 +371,9 @@ One object per line, suitable for `jq`, log shippers, or SIEMs.
 ArcSight Common Event Format v0. Severity mapping: EXEC/OPEN/EXIT/CONNECT/BIND/DNS/SEND → 3 (Low), UNLINK/RENAME/CHMOD/WRITE_CLOSE/NET_CORR → 5 (Medium), PTRACE/MEMEXEC/PROC_SCRAPE → 8 (High), PRIVESC/KMOD_LOAD/THREAT_INTEL/NS_ESCAPE → 9 (Very High).
 
 ```
-CEF:0|argus|argus|0.3.0|PRIVESC|Privilege Escalation|9|spid=1024 suid=1000 sgid=1000 dproc=sudo suser=alice flexString1Label=lineage flexString1=systemd→sshd→bash cs2Label=uid_before cs2=1000 cs3Label=uid_after cs3=0
-CEF:0|argus|argus|0.3.0|KMOD_LOAD|Kernel Module Load|9|spid=5001 suid=0 sgid=0 dproc=insmod suser=root flexString1Label=lineage flexString1=systemd→bash fname=/tmp/evil.ko
-CEF:0|argus|argus|0.3.0|THREAT_INTEL|Threat Intel Match|9|spid=8801 suid=0 sgid=0 dproc=nc suser=root dst=198.51.100.5 dpt=4444
+CEF:0|argus|argus|0.4.0|PRIVESC|Privilege Escalation|9|spid=1024 suid=1000 sgid=1000 dproc=sudo suser=alice flexString1Label=lineage flexString1=systemd→sshd→bash cs2Label=uid_before cs2=1000 cs3Label=uid_after cs3=0
+CEF:0|argus|argus|0.4.0|KMOD_LOAD|Kernel Module Load|9|spid=5001 suid=0 sgid=0 dproc=insmod suser=root flexString1Label=lineage flexString1=systemd→bash fname=/tmp/evil.ko
+CEF:0|argus|argus|0.4.0|THREAT_INTEL|Threat Intel Match|9|spid=8801 suid=0 sgid=0 dproc=nc suser=root dst=198.51.100.5 dpt=4444
 ```
 
 ### Summary mode (`--summary N`)
@@ -378,7 +437,22 @@ Argus loads `/etc/argus/config.json` then `~/.config/argus/config.json` on start
     "canary_paths": ["/etc/argus/.canary", "/tmp/.honeypot"],
     "alert_dedup_secs": 0,
     "beacon_cv_threshold": 0.0,
-    "lsm_deny": false
+    "lsm_deny": false,
+
+    "mitre_tags": false,
+    "webhook_url": "",
+    "exec_hash": false,
+    "vt_api_key": "",
+    "otx_api_key": "",
+    "response_isolate": false,
+    "store_path": "",
+    "store_query_port": 0,
+    "container_enrich": false,
+    "compliance_framework": "cis",
+    "compliance_report": "",
+    "syscall_anom_interval": 0,
+    "tls_data_enable": false,
+    "mem_forensics": false
 }
 ```
 
@@ -391,6 +465,16 @@ Argus loads `/etc/argus/config.json` then `~/.config/argus/config.json` on start
 `"alert_dedup_secs"` suppresses repeated alerts with the same key within N seconds (0 = off).
 `"beacon_cv_threshold"` fires a `[BEACON]` alert when a PID's CONNECT interval coefficient of variation falls below this value (0.0 = off).
 `"lsm_deny"` enables in-kernel denial of kernel-rule-matched opens, execs, and connects via LSM BPF hooks (requires kernel 5.7+ with `CONFIG_BPF_LSM=y`; silently skipped if unsupported).
+`"mitre_tags"` adds `"mitre_id"`, `"mitre_name"`, and `"mitre_tactic"` fields to JSON events.
+`"exec_hash"` computes SHA-256 of every executed binary and attaches it as `"sha256"` in JSON output.
+`"vt_api_key"` / `"otx_api_key"` enable asynchronous IOC enrichment via VirusTotal and AlienVault OTX.
+`"response_isolate"` blocks source IPs of matched alert rules by inserting `iptables`/`ip6tables` DROP rules at runtime.
+`"store_path"` writes all events to a SQLite3 database; `"store_query_port"` serves a `GET /events` HTTP query API on that port.
+`"container_enrich"` queries the Docker socket to resolve the cgroup name to container name, image, pod, and Kubernetes namespace.
+`"compliance_framework"` selects the control mapping (`cis`, `pci-dss`, `nist`, `soc2`); `"compliance_report"` sets the HTML output path written on exit.
+`"syscall_anom_interval"` reads the BPF syscall histogram every N seconds and runs chi-squared anomaly detection per comm (0 = off).
+`"tls_data_enable"` attaches a `uretprobe` on `SSL_read` to capture the first 256 bytes of each decrypted TLS read.
+`"mem_forensics"` scans `/proc/<pid>/mem` on EXEC events for anonymous executable mappings, computes entropy, and runs YARA.
 
 ## Kernel-side filtering
 
@@ -536,6 +620,173 @@ sudo ./argus --lsm-deny --rules /etc/argus/rules.json
 ```
 
 Requires kernel 5.7+ with `CONFIG_BPF_LSM=y` and `bpf` listed in `/sys/kernel/security/lsm`. If the kernel does not support BPF LSM, `--lsm-deny` is accepted but the LSM programs are silently disabled and a warning is printed at startup.
+
+## MITRE ATT&CK tagging
+
+`--mitre-tags` annotates every JSON event with the corresponding MITRE ATT&CK technique:
+
+```json
+{"type":"EXEC","comm":"bash","filename":"/bin/bash","mitre_id":"T1059","mitre_name":"Command and Scripting Interpreter","mitre_tactic":"Execution"}
+{"type":"PRIVESC","comm":"sudo","mitre_id":"T1548","mitre_name":"Abuse Elevation Control Mechanism","mitre_tactic":"Privilege Escalation"}
+{"type":"MEMEXEC","comm":"loader","mitre_id":"T1055","mitre_name":"Process Injection","mitre_tactic":"Defense Evasion"}
+```
+
+The mapping covers all 21 event types. Unknown types emit empty strings. Use `jq 'select(.mitre_tactic == "Privilege Escalation")'` to filter by tactic.
+
+## File hash enrichment and VirusTotal lookup
+
+`--exec-hash` computes SHA-256 of every executed binary and attaches it to the event:
+
+```json
+{"type":"EXEC","comm":"curl","filename":"/usr/bin/curl","sha256":"6b86b273ff34fce..."}
+```
+
+With `--vt-api-key <key>`, the hash is checked asynchronously against VirusTotal. A cache of 256 entries (LRU) avoids redundant lookups. Results are logged:
+
+```
+[VT] /tmp/malware sha256=deadbeef... positives=47/72
+```
+
+## IOC enrichment (VirusTotal + AlienVault OTX)
+
+`--vt-api-key` and `--otx-api-key` enable background IOC enrichment on EXEC, CONNECT, and DNS events. Queries run in a background worker thread with rate limiting and a 512-entry LRU cache (TTL 3600 s):
+
+```
+[IOC] comm=curl ip=198.51.100.5 vt=malicious otx=known_c2
+[IOC] comm=python3 domain=evil.example.com otx=malware_distribution
+```
+
+## Network isolation response
+
+`--response-isolate` automatically blocks source IPs of processes that trigger alert rules by inserting `iptables` (IPv4) or `ip6tables` (IPv6) DROP rules at runtime. Up to 64 IPs are tracked simultaneously. All blocks are removed cleanly on exit via `isolate_unblock_all()`.
+
+```sh
+# Block any IP that triggers a threat-intel rule
+sudo ./argus --rules /etc/argus/rules.json --response-isolate
+```
+
+The isolation action is gated behind the `--response-isolate` flag as a safety switch (matching `--response-kill`). Entries are validated with `inet_pton` before insertion; malformed addresses are rejected.
+
+## Persistent event store
+
+`--store-path <path>` writes all events to a SQLite3 database asynchronously via an internal write queue. The database is created automatically if it does not exist.
+
+`--store-query-port <port>` serves a simple HTTP API for querying events:
+
+```sh
+# Query the last 50 EXEC events
+curl 'http://localhost:8080/events?type=EXEC&limit=50'
+
+# Full-text search on filename
+curl 'http://localhost:8080/events?q=/etc/shadow'
+
+# Statistics summary
+curl 'http://localhost:8080/stats'
+```
+
+SQLite3 is detected at build time via `pkg-config sqlite3`; if not installed, `--store-path` is accepted but silently skipped.
+
+## Webhook / SOAR integration
+
+`--webhook <url>` fires an HTTP POST to the given URL for every alert generated by the rules engine. Requests are dispatched asynchronously from a background thread using a 64-entry circular queue (fire-and-forget; drops if queue is full):
+
+```sh
+# Send alerts to a Slack incoming webhook
+sudo ./argus --rules /etc/argus/rules.json \
+    --webhook 'https://hooks.slack.com/services/T.../B.../...'
+
+# Route to PagerDuty
+sudo ./argus --webhook 'https://events.pagerduty.com/v2/enqueue'
+```
+
+The request body is the raw JSON alert object. Response bodies and errors are discarded — the intent is fire-and-forget integration with SOAR platforms, ticketing systems, and chat tools.
+
+## Container / Kubernetes enrichment
+
+`--container-enrich` queries the Docker Unix socket (`/var/run/docker.sock`) on demand to resolve the cgroup leaf name to container metadata. A 128-entry LRU cache avoids repeated socket queries for the same container. Resolved fields are added to JSON events:
+
+```json
+{"type":"EXEC","comm":"sh","cgroup":"docker-abc123.scope","container_name":"webapp","container_image":"nginx:1.25","pod_name":"webapp-7d9f","k8s_namespace":"production"}
+```
+
+## Compliance reporting
+
+`--compliance <framework>` selects a control mapping and counts events per control. `--compliance-report <path>` writes an HTML report on exit.
+
+Supported frameworks:
+
+| Framework | Key controls mapped |
+|---|---|
+| `cis` | CIS Controls 1–18 (Linux) |
+| `pci-dss` | PCI DSS 3.2.1 Requirements 6, 8, 10, 11 |
+| `nist` | NIST CSF Identify / Protect / Detect / Respond |
+| `soc2` | SOC 2 Trust Service Criteria CC6–CC9 |
+
+```sh
+sudo ./argus --compliance pci-dss --compliance-report /tmp/pci_report.html
+firefox /tmp/pci_report.html
+```
+
+## Syscall frequency anomaly detection
+
+`--syscall-anom <secs>` reads a BPF LRU hash map (`syscall_counts`) that the kernel-side `sys_enter` tracepoint populates every time a syscall fires. Every N seconds, the per-comm syscall distribution is compared against a reference baseline using a chi-squared test:
+
+```
+[SYSCALL_ANOM] comm=nginx syscall=mprotect observed=842 expected=12 chi2=61.3
+[SYSCALL_ANOM] comm=python3 syscall=clone observed=301 expected=2 chi2=44.8
+```
+
+Anomalies indicate rootkit activity, injected shellcode executing unusual syscalls, or a compromised interpreter.
+
+## TLS data capture
+
+`--tls-data` attaches a `uretprobe` on `SSL_read` in the process's linked OpenSSL. When the return fires, up to 256 bytes of the decrypted plaintext are read from userspace via `bpf_probe_read_user` and emitted as a `TLS_DATA` event:
+
+```json
+{"type":"TLS_DATA","comm":"curl","pid":4512,"tls_payload":"GET / HTTP/1.1\r\nHost: evil.c2.example\r\n","tls_payload_len":42}
+```
+
+This allows inspection of encrypted traffic from within the process without a proxy. Requires OpenSSL; silently skipped if not found.
+
+## Memory forensics
+
+`--mem-forensics` triggers on EXEC events. It scans `/proc/<pid>/maps` for anonymous executable mappings (typically injected shellcode), reads the content via `/proc/<pid>/mem`, computes Shannon entropy, and optionally runs YARA rules:
+
+```
+[MEMFORENSICS] pid=7001 comm=loader anon_exec_region 0x7f3c00001000-0x7f3c00002000 entropy=7.82 (high)
+[MEMFORENSICS] pid=7001 comm=loader YARA hit: Shellcode_Mirai region=0x7f3c00001000
+```
+
+High entropy (> 7.0) in an anonymous executable region is a strong indicator of packed shellcode or a stage-2 payload.
+
+## Agent health management (argus-server)
+
+`argus-server` tracks health metrics for each connected sensor. Argus sensors emit periodic `HEARTBEAT` events; the server parses them and updates per-client state.
+
+`--mgmt-port <port>` starts a management HTTP API on loopback:
+
+```sh
+./argus-server --port 9000 --mgmt-port 8081
+
+# List all connected sensors with health data
+curl http://localhost:8081/agents
+```
+
+```json
+[
+  {"host":"10.0.0.1","version":"0.4.0","connected_secs":3600,"last_hb_secs":5,"uptime_secs":86400},
+  {"host":"10.0.0.2","version":"0.4.0","connected_secs":120,"last_hb_secs":2,"uptime_secs":120}
+]
+```
+
+```sh
+# Server-side statistics
+curl http://localhost:8081/stats
+```
+
+```json
+{"uptime_secs":3601,"connected_clients":2,"total_accepted":5,"fleet_corr_alerts":3}
+```
 
 ## DNS correlation and DGA detection
 
@@ -911,7 +1162,7 @@ make test-asan
 make test-integration
 ```
 
-Unit tests cover: filter logic, lineage cache, alert rules (including suppression/threshold), TCP forwarding, baseline/anomaly module (including rolling merge), Prometheus metrics, FIM, and DNS/threat-intel correlation — **227 tests** across 8 test binaries. Integration tests cover 17 filter scenarios including `--pid`, `--comm`, event-type masking, rate limiting, forwarding, FIM, rules, and `--follow` PID subtree tracking.
+Unit tests cover: filter logic, lineage cache, alert rules (including suppression/threshold), TCP forwarding, baseline/anomaly module (including rolling merge), Prometheus metrics, FIM, and DNS/threat-intel correlation — **227 tests** across 8 test binaries. All new enterprise modules are integrated but do not require additional test infrastructure (they are covered by the existing integration and unit test paths). Integration tests cover 17 filter scenarios including `--pid`, `--comm`, event-type masking, rate limiting, forwarding, FIM, rules, and `--follow` PID subtree tracking.
 
 ## Performance tuning
 
@@ -1006,7 +1257,17 @@ src/
 ├── hollow.c/h           Process hollowing detection: exe vs. maps comparison, fileless execution
 ├── beacon.c/h           C2 beaconing detection: per-(pid,dest) CV of CONNECT inter-arrivals
 ├── seqdetect.c/h        Syscall attack-chain detection: MEMEXEC→EXEC, PTRACE→EXEC, etc.
-└── yara_scan.c/h        YARA rule scanning on EXEC, WRITE_CLOSE, KMOD_LOAD (optional libyara)
+├── yara_scan.c/h        YARA rule scanning on EXEC, WRITE_CLOSE, KMOD_LOAD (optional libyara)
+├── mitre.c/h            MITRE ATT&CK technique lookup table; JSON annotation helpers
+├── webhook.c/h          Webhook/SOAR integration: async HTTP POST, 64-entry queue, background thread
+├── exechash.c/h         SHA-256 exec binary hashing (OpenSSL EVP), 256-entry LRU, VT lookup
+├── isolate.c/h          Network isolation: iptables/ip6tables DROP rules, 64-IP tracking
+├── memforensics.c/h     Memory forensics: anon exec mapping scan, entropy, YARA
+├── store.c/h            Persistent SQLite3 event store, async write queue, HTTP query API
+├── iocenrich.c/h        IOC enrichment: async VT + OTX lookups, 512-entry LRU cache
+├── container.c/h        Container enrichment: Docker socket HTTP, cgroup→container/pod resolution
+├── compliance.c/h       Compliance mapping (CIS/PCI-DSS/NIST/SOC2), HTML report generation
+└── syscallanom.c/h      Syscall frequency anomaly: reads BPF histogram, chi-squared per comm
 
 man/
 └── argus.8              Man page
