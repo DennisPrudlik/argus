@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "output.h"
+#include "canary.h"
 
 /*
  * Full runtime configuration for argus.
@@ -69,6 +70,19 @@ typedef struct {
 
     /* ── Per-PID rate limiting ───────────────────────────────────────────── */
     uint32_t     rate_limit_per_pid;   /* userspace copy for config               */
+
+    /* ── Canary / honeypot file detection ───────────────────────────────── */
+    char         canary_paths[CANARY_MAX_PATHS][256];
+    int          canary_path_count;
+
+    /* ── Alert deduplication ─────────────────────────────────────────────── */
+    int          alert_dedup_secs;     /* 0 = disabled; N = suppress window       */
+
+    /* ── C2 beaconing detection ──────────────────────────────────────────── */
+    double       beacon_cv_threshold;  /* 0 = disabled; typical 0.15              */
+
+    /* ── LSM BPF enforcement ─────────────────────────────────────────────── */
+    int          lsm_deny;            /* 1 = enforce kernel_rules via LSM hooks  */
 } argus_cfg_t;
 
 /* Fill cfg with safe defaults (no filters, 256KB ring buffer, no summary) */

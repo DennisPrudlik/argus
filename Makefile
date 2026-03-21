@@ -14,6 +14,14 @@ ifneq ($(OPENSSL_LIBS),)
 CFLAGS += -DHAVE_OPENSSL $(shell pkg-config --cflags openssl 2>/dev/null)
 endif
 
+# Optional YARA — detected automatically; used for in-process rule scanning
+YARA_LIBS := $(shell pkg-config --libs yara 2>/dev/null)
+ifneq ($(YARA_LIBS),)
+CFLAGS += -DHAVE_YARA $(shell pkg-config --cflags yara 2>/dev/null)
+else
+YARA_LIBS :=
+endif
+
 # Seccomp — present on Linux kernels; gracefully absent on non-Linux
 HAVE_SECCOMP := $(shell test -f /usr/include/linux/seccomp.h && echo yes)
 # (seccomp.c guards itself with #ifdef __linux__ so no extra CFLAGS needed)
@@ -47,12 +55,16 @@ argus.skel.h: argus.bpf.o
 # 4. Compile the userspace loader
 argus: argus.c output.c lineage.c config.c rules.c forward.c dns.c \
        baseline.c seccomp.c metrics.c fim.c ldpreload.c threatintel.c \
+       canary.c dedup.c hollow.c beacon.c seqdetect.c yara_scan.c \
        output.h lineage.h config.h rules.h forward.h dns.h baseline.h \
-       seccomp.h metrics.h fim.h ldpreload.h threatintel.h argus.skel.h argus.h
+       seccomp.h metrics.h fim.h ldpreload.h threatintel.h \
+       canary.h dedup.h hollow.h beacon.h seqdetect.h yara_scan.h \
+       argus.skel.h argus.h
 	$(CC) $(CFLAGS) -o $@ argus.c output.c lineage.c config.c rules.c \
 	    forward.c dns.c baseline.c seccomp.c metrics.c \
 	    fim.c ldpreload.c threatintel.c \
-	    -lbpf -lelf -lz -lpthread -lm $(OPENSSL_LIBS)
+	    canary.c dedup.c hollow.c beacon.c seqdetect.c yara_scan.c \
+	    -lbpf -lelf -lz -lpthread -lm $(OPENSSL_LIBS) $(YARA_LIBS)
 
 # 5. Fleet aggregator — no BPF dependency
 argus-server: argus-server.c argus.h

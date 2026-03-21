@@ -13,6 +13,7 @@ void cfg_defaults(argus_cfg_t *cfg)
     cfg->filter.event_mask  = TRACE_ALL;
     cfg->ring_buffer_kb     = 256;
     cfg->summary_interval   = 0;
+    cfg->ldpreload_check    = 1;
 
     /*
      * Suppress high-frequency kernel pseudo-filesystem noise by default.
@@ -324,6 +325,33 @@ int cfg_load(const char *path, argus_cfg_t *cfg)
         }
         else if (strcmp(key, "rate_limit_per_pid") == 0) {
             int v = 0; p = parse_int(p, &v); cfg->rate_limit_per_pid = (uint32_t)v;
+        }
+        else if (strcmp(key, "canary_paths") == 0) {
+            /* array of strings */
+            p = skip_ws(p);
+            if (*p == '[') {
+                p++;
+                while (*p && *p != ']') {
+                    p = skip_ws(p);
+                    if (*p == '"' && cfg->canary_path_count < CANARY_MAX_PATHS) {
+                        p = parse_str(p, cfg->canary_paths[cfg->canary_path_count],
+                                      sizeof(cfg->canary_paths[0]));
+                        cfg->canary_path_count++;
+                    } else {
+                        while (*p && *p != ',' && *p != ']') p++;
+                    }
+                    p = skip_ws(p);
+                    if (*p == ',') p++;
+                }
+                if (*p == ']') p++;
+            }
+        }
+        else if (strcmp(key, "alert_dedup_secs") == 0)
+            p = parse_int(p, &cfg->alert_dedup_secs);
+        else if (strcmp(key, "beacon_cv_threshold") == 0)
+            p = parse_double(p, &cfg->beacon_cv_threshold);
+        else if (strcmp(key, "lsm_deny") == 0) {
+            int v = 0; p = parse_bool(p, &v); cfg->lsm_deny = v;
         }
 
         /* advance past current value to next key */

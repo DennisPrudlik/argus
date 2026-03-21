@@ -1732,4 +1732,60 @@ int handle_setns_exit(struct trace_event_raw_sys_exit *ctx)
     return 0;
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * LSM enforcement — optional, kernel 5.7+ with CONFIG_BPF_LSM=y.
+ *
+ * These programs enforce kernel_rules in-kernel: if a matching rule exists
+ * and lsm_deny_active == 1 in config_map, the operation is denied with
+ * -EPERM before it even reaches the syscall handler.
+ *
+ * argus.c checks for BPF LSM support at runtime and calls
+ * bpf_program__set_autoload(false) on these programs when unsupported,
+ * so the skeleton loads cleanly on older kernels.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+static __always_inline int lsm_should_deny(char comm[16], int etype,
+                                            uint32_t uid)
+{
+    uint32_t zero = 0;
+    argus_config_t *cfg = bpf_map_lookup_elem(&config_map, &zero);
+    if (!cfg || !cfg->lsm_deny_active)
+        return 0;
+    return kernel_rule_drop(0, comm, etype, uid);
+}
+
+SEC("lsm/file_open")
+int BPF_PROG(lsm_file_open, struct file *file, int ret)
+{
+    if (ret != 0) return ret;   /* already denied upstream */
+    uint64_t uid_gid = bpf_get_current_uid_gid();
+    uint32_t uid     = (uint32_t)uid_gid;
+    char comm[16]    = {};
+    bpf_get_current_comm(comm, sizeof(comm));
+    return lsm_should_deny(comm, EVENT_OPEN, uid) ? -1 : 0;
+}
+
+SEC("lsm/bprm_check_security")
+int BPF_PROG(lsm_bprm_check, struct linux_binprm *bprm, int ret)
+{
+    if (ret != 0) return ret;
+    uint64_t uid_gid = bpf_get_current_uid_gid();
+    uint32_t uid     = (uint32_t)uid_gid;
+    char comm[16]    = {};
+    bpf_get_current_comm(comm, sizeof(comm));
+    return lsm_should_deny(comm, EVENT_EXEC, uid) ? -1 : 0;
+}
+
+SEC("lsm/socket_connect")
+int BPF_PROG(lsm_socket_connect, struct socket *sock,
+             struct sockaddr *address, int addrlen, int ret)
+{
+    if (ret != 0) return ret;
+    uint64_t uid_gid = bpf_get_current_uid_gid();
+    uint32_t uid     = (uint32_t)uid_gid;
+    char comm[16]    = {};
+    bpf_get_current_comm(comm, sizeof(comm));
+    return lsm_should_deny(comm, EVENT_CONNECT, uid) ? -1 : 0;
+}
+
 char LICENSE[] SEC("license") = "GPL";

@@ -7,10 +7,18 @@
  *
  * Usage:
  *   argus-server [--port <N>] [--output <path>] [--stats-interval <secs>]
+ *                [--correlate-window <secs>] [--correlate-threshold <N>]
  *
  * Each connected argus client sends {"type":"...","pid":...,...}\n lines.
  * argus-server injects "host":"<remote-ip>" into every object and writes
  * the result to the output sink.
+ *
+ * Fleet correlation engine:
+ *   Tracks IOCs (IP+port for CONNECT/THREAT_INTEL, filename for EXEC/OPEN/
+ *   WRITE_CLOSE/UNLINK, comm for PRIVESC/KMOD_LOAD) across all connected
+ *   sensors.  When the same IOC is seen from >= correlate_threshold distinct
+ *   hosts within correlate_window seconds a [FLEET] alert is emitted to
+ *   stderr and injected into the output stream.
  *
  * Supports up to 64 simultaneous agent connections using select().
  */
@@ -31,6 +39,182 @@
 #define DEFAULT_PORT    9000
 #define MAX_CLIENTS     64
 #define LINE_BUF_SZ     4096
+
+/* ── fleet correlation engine ────────────────────────────────────────────── */
+
+#define CORR_SLOTS      2048   /* hash table size for IOC tracking            */
+#define CORR_MAX_HOSTS  16     /* max unique hosts tracked per IOC slot       */
+#define CORR_KEY_SZ     192    /* max IOC key string length                   */
+
+typedef struct {
+    char   key[CORR_KEY_SZ];          /* "TYPE:value" e.g. "CONNECT:1.2.3.4:443" */
+    char   hosts[CORR_MAX_HOSTS][INET6_ADDRSTRLEN];
+    time_t times[CORR_MAX_HOSTS];
+    int    n_hosts;
+    int    alerted;
+} corr_entry_t;
+
+static corr_entry_t g_corr[CORR_SLOTS];
+static int          g_corr_window    = 60;   /* seconds */
+static int          g_corr_threshold = 3;    /* distinct hosts to fire alert */
+
+static unsigned int corr_hash(const char *key)
+{
+    unsigned long h = 5381;
+    int c;
+    while ((c = (unsigned char)*key++))
+        h = ((h << 5) + h) + (unsigned long)c;
+    return (unsigned int)(h % CORR_SLOTS);
+}
+
+/* Extract a JSON string value for a given key; returns 1 on success */
+static int json_str(const char *json, const char *field,
+                    char *out, size_t outsz)
+{
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"%s\":", field);
+    const char *p = strstr(json, needle);
+    if (!p) return 0;
+    p += strlen(needle);
+    while (*p == ' ') p++;
+    if (*p != '"') return 0;
+    p++;
+    size_t i = 0;
+    while (*p && *p != '"' && i < outsz - 1) out[i++] = *p++;
+    out[i] = '\0';
+    return i > 0 ? 1 : 0;
+}
+
+/* Build a canonical IOC key from a JSON event line; returns 1 on success */
+static int corr_make_key(const char *line, char *key, size_t keysz)
+{
+    char type[32]     = {};
+    char filename[192]= {};
+    char daddr[64]    = {};
+    char dport[16]    = {};
+    char comm[32]     = {};
+
+    if (!json_str(line, "type", type, sizeof(type)))
+        return 0;
+
+    /* CONNECT / THREAT_INTEL → key on dest IP + port */
+    if (strcmp(type, "CONNECT") == 0 || strcmp(type, "THREAT_INTEL") == 0) {
+        json_str(line, "daddr", daddr, sizeof(daddr));
+        json_str(line, "dport", dport, sizeof(dport));
+        if (!daddr[0]) return 0;
+        snprintf(key, keysz, "%s:%s:%s", type, daddr, dport);
+        return 1;
+    }
+
+    /* EXEC / OPEN / WRITE_CLOSE / UNLINK / KMOD_LOAD → key on filename */
+    if (strcmp(type, "EXEC") == 0      || strcmp(type, "OPEN") == 0 ||
+        strcmp(type, "WRITE_CLOSE") == 0|| strcmp(type, "UNLINK") == 0 ||
+        strcmp(type, "KMOD_LOAD") == 0) {
+        json_str(line, "filename", filename, sizeof(filename));
+        if (!filename[0]) return 0;
+        snprintf(key, keysz, "%s:%s", type, filename);
+        return 1;
+    }
+
+    /* PRIVESC / NS_ESCAPE / PTRACE → key on comm */
+    if (strcmp(type, "PRIVESC") == 0 || strcmp(type, "NS_ESCAPE") == 0 ||
+        strcmp(type, "PTRACE") == 0) {
+        json_str(line, "comm", comm, sizeof(comm));
+        if (!comm[0]) return 0;
+        snprintf(key, keysz, "%s:%s", type, comm);
+        return 1;
+    }
+
+    return 0;   /* event type not tracked */
+}
+
+/* Record an IOC sighting from host; returns 1 if alert threshold reached. */
+static int corr_record(const char *key, const char *host)
+{
+    if (!g_corr_threshold || !g_corr_window)
+        return 0;
+
+    time_t now = time(NULL);
+    unsigned int slot = corr_hash(key);
+
+    /* Linear probe */
+    for (unsigned int i = 0; i < CORR_SLOTS; i++) {
+        unsigned int idx = (slot + i) % CORR_SLOTS;
+        corr_entry_t *e  = &g_corr[idx];
+
+        if (!e->key[0]) {
+            /* Empty slot — insert */
+            strncpy(e->key, key, CORR_KEY_SZ - 1);
+            strncpy(e->hosts[0], host, INET6_ADDRSTRLEN - 1);
+            e->times[0]  = now;
+            e->n_hosts   = 1;
+            e->alerted   = 0;
+            return 0;
+        }
+
+        if (strncmp(e->key, key, CORR_KEY_SZ) != 0)
+            continue;
+
+        if (e->alerted)
+            return 0;   /* already fired, don't re-alert */
+
+        /* Expire old sightings outside the window */
+        int fresh = 0;
+        for (int j = 0; j < e->n_hosts; j++) {
+            if (now - e->times[j] <= (time_t)g_corr_window) {
+                if (j != fresh) {
+                    memcpy(e->hosts[fresh], e->hosts[j], INET6_ADDRSTRLEN);
+                    e->times[fresh] = e->times[j];
+                }
+                fresh++;
+            }
+        }
+        e->n_hosts = fresh;
+
+        /* Check if this host is already recorded */
+        for (int j = 0; j < e->n_hosts; j++)
+            if (strcmp(e->hosts[j], host) == 0) {
+                e->times[j] = now;   /* refresh */
+                goto check_threshold;
+            }
+
+        /* Add new host */
+        if (e->n_hosts < CORR_MAX_HOSTS) {
+            strncpy(e->hosts[e->n_hosts], host, INET6_ADDRSTRLEN - 1);
+            e->times[e->n_hosts] = now;
+            e->n_hosts++;
+        }
+
+    check_threshold:
+        if (e->n_hosts >= g_corr_threshold) {
+            e->alerted = 1;
+            return 1;
+        }
+        return 0;
+    }
+    return 0;
+}
+
+/* Emit a fleet correlation alert */
+static void corr_alert(const char *key, const char *line, const char *host)
+{
+    FILE *out = g_out ? g_out : stdout;
+
+    fprintf(stderr,
+        "[FLEET] IOC seen on %d+ hosts: %s  (latest from %s)\n",
+        g_corr_threshold, key, host);
+
+    /* Also inject a synthetic alert event into the output stream */
+    fprintf(out,
+        "{\"host\":\"fleet\",\"type\":\"FLEET_CORR\","
+        "\"ioc\":\"%s\","
+        "\"threshold\":%d,"
+        "\"window\":%d,"
+        "\"trigger_host\":\"%s\"}\n",
+        key, g_corr_threshold, g_corr_window, host);
+    fflush(out);
+    (void)line;
+}
 
 /* ── per-client state ────────────────────────────────────────────────────── */
 
@@ -163,6 +347,13 @@ static void read_client(client_t *c)
             emit_with_host(start, c->remote_ip);
             c->lines++;
             g_total_lines++;
+
+            /* Fleet correlation */
+            char corr_key[CORR_KEY_SZ];
+            if (corr_make_key(start, corr_key, sizeof(corr_key))) {
+                if (corr_record(corr_key, c->remote_ip))
+                    corr_alert(corr_key, start, c->remote_ip);
+            }
         }
         start = nl + 1;
     }
@@ -189,13 +380,16 @@ static void usage(const char *prog)
         "Usage: %s [OPTIONS]\n"
         "\n"
         "argus-server — fleet aggregator: accepts NDJSON streams from argus\n"
-        "agents and re-emits them with a \"host\" field injected.\n"
+        "agents, re-emits them with a \"host\" field, and correlates IOCs\n"
+        "across multiple sensors.\n"
         "\n"
         "Options:\n"
-        "  --port            <N>     Listen port (default: %d)\n"
-        "  --output          <path>  Write merged stream to file (default: stdout)\n"
-        "  --stats-interval  <secs>  Print connection stats every N seconds (0=off)\n"
-        "  --help                    Show this message\n",
+        "  --port                <N>     Listen port (default: %d)\n"
+        "  --output              <path>  Write merged stream to file (default: stdout)\n"
+        "  --stats-interval      <secs>  Print connection stats every N seconds (0=off)\n"
+        "  --correlate-window    <secs>  Fleet correlation time window (default: 60)\n"
+        "  --correlate-threshold <N>     Distinct hosts to trigger fleet alert (default: 3)\n"
+        "  --help                        Show this message\n",
         prog, DEFAULT_PORT);
 }
 
@@ -208,19 +402,23 @@ int main(int argc, char **argv)
     int  stats_interval = 60;
 
     static const struct option long_opts[] = {
-        {"port",           required_argument, 0, 'p'},
-        {"output",         required_argument, 0, 'o'},
-        {"stats-interval", required_argument, 0, 's'},
-        {"help",           no_argument,       0, 'h'},
+        {"port",                required_argument, 0, 'p'},
+        {"output",              required_argument, 0, 'o'},
+        {"stats-interval",      required_argument, 0, 's'},
+        {"correlate-window",    required_argument, 0, 'w'},
+        {"correlate-threshold", required_argument, 0, 'c'},
+        {"help",                no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:o:s:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:o:s:w:c:h", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'p': port = atoi(optarg); break;
         case 'o': strncpy(output_path, optarg, sizeof(output_path) - 1); break;
         case 's': stats_interval = atoi(optarg); break;
+        case 'w': g_corr_window    = atoi(optarg); break;
+        case 'c': g_corr_threshold = atoi(optarg); break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 1;
         }

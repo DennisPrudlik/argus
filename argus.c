@@ -24,6 +24,12 @@
 #include "fim.h"
 #include "ldpreload.h"
 #include "threatintel.h"
+#include "canary.h"
+#include "dedup.h"
+#include "hollow.h"
+#include "beacon.h"
+#include "seqdetect.h"
+#include "yara_scan.h"
 
 static volatile int running       = 1;
 static volatile int reload_config = 0;
@@ -247,10 +253,12 @@ static int parse_event_list(const char *s)
 
 /* ── BPF setup ──────────────────────────────────────────────────────────── */
 
+static int bpf_lsm_supported(void);  /* forward declaration */
+
 static void setup_bpf_filters(struct argus_bpf *skel, const filter_t *f,
                                uint32_t rate_limit_per_comm,
                                uint32_t rate_limit_per_pid,
-                               int follow_pid)
+                               int follow_pid, int lsm_deny)
 {
     argus_config_t cfg = {};
     uint32_t zero = 0;
@@ -279,12 +287,24 @@ static void setup_bpf_filters(struct argus_bpf *skel, const filter_t *f,
     }
     cfg.rate_limit_per_comm = rate_limit_per_comm;
     cfg.rate_limit_per_pid  = rate_limit_per_pid;
+    cfg.lsm_deny_active     = (uint8_t)(lsm_deny && bpf_lsm_supported() ? 1 : 0);
     bpf_map_update_elem(bpf_map__fd(skel->maps.config_map),
                         &zero, &cfg, BPF_ANY);
 }
 
+/* Returns 1 if the running kernel has BPF LSM support. */
+static int bpf_lsm_supported(void)
+{
+    FILE *f = fopen("/sys/kernel/security/lsm", "r");
+    if (!f) return 0;
+    char buf[256] = {};
+    fgets(buf, sizeof(buf), f);
+    fclose(f);
+    return strstr(buf, "bpf") != NULL;
+}
+
 static void configure_programs(struct argus_bpf *skel, int event_mask,
-                               int follow_pid)
+                               int follow_pid, int lsm_deny)
 {
     /* 0 means trace-all (same convention as print_header / event_matches) */
     if (!event_mask) event_mask = TRACE_ALL;
@@ -334,6 +354,14 @@ static void configure_programs(struct argus_bpf *skel, int event_mask,
     }
     if (!(event_mask & TRACE_WRITE_CLOSE))
         bpf_program__set_autoload(skel->progs.handle_close_enter, false);
+
+    /* LSM enforcement programs — only load when explicitly requested AND
+     * the kernel actually supports BPF LSM (5.7+, CONFIG_BPF_LSM=y). */
+    if (!lsm_deny || !bpf_lsm_supported()) {
+        bpf_program__set_autoload(skel->progs.lsm_file_open,      false);
+        bpf_program__set_autoload(skel->progs.lsm_bprm_check,     false);
+        bpf_program__set_autoload(skel->progs.lsm_socket_connect,  false);
+    }
 }
 
 /* ── event handler ──────────────────────────────────────────────────────── */
@@ -395,6 +423,21 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
     /* ── FIM check on file close-after-write ──────────────────────────── */
     if (ev->type == EVENT_WRITE_CLOSE)
         fim_check(ev);
+
+    /* ── Canary / honeypot file detection ────────────────────────────── */
+    canary_check(ev);
+
+    /* ── Process hollowing detection ─────────────────────────────────── */
+    hollow_check(ev);
+
+    /* ── C2 beaconing detection ──────────────────────────────────────── */
+    beacon_check(ev);
+
+    /* ── Syscall sequence / attack-chain detection ───────────────────── */
+    seqdetect_check(ev);
+
+    /* ── YARA scanning on exec and file writes ───────────────────────── */
+    yara_scan_event(ev);
 
     /* ── KMOD_LOAD: resolve fd→filename via /proc ─────────────────────── */
     if (ev->type == EVENT_KMOD_LOAD && ev->target_pid > 0) {
@@ -500,6 +543,12 @@ int main(int argc, char **argv)
         {"config-check",    no_argument,       0, 'K'},
         {"version",         no_argument,       0, 'V'},
         {"help",            no_argument,       0, 'h'},
+        /* ── new detection options ── */
+        {"canary",          required_argument, 0, 1000},
+        {"alert-dedup",     required_argument, 0, 1001},
+        {"beacon-cv",       required_argument, 0, 1002},
+        {"lsm-deny",        no_argument,       0, 1003},
+        {"yara-rules",      required_argument, 0, 1004},
         {0, 0, 0, 0}
     };
 
@@ -565,6 +614,23 @@ int main(int argc, char **argv)
         case 'K': config_check              = 1;                                         break;
         case 'V': printf("argus %s\n", ARGUS_VERSION); return 0;
         case 'h': usage(argv[0]); return 0;
+        case 1000: /* --canary */
+            if (cfg.canary_path_count < CANARY_MAX_PATHS)
+                strncpy(cfg.canary_paths[cfg.canary_path_count++],
+                        optarg, 255);
+            break;
+        case 1001: /* --alert-dedup */
+            cfg.alert_dedup_secs = atoi(optarg);
+            break;
+        case 1002: /* --beacon-cv */
+            cfg.beacon_cv_threshold = atof(optarg);
+            break;
+        case 1003: /* --lsm-deny */
+            cfg.lsm_deny = 1;
+            break;
+        case 1004: /* --yara-rules */
+            strncpy(cfg.yara_rules_dir, optarg, sizeof(cfg.yara_rules_dir) - 1);
+            break;
         default:  usage(argv[0]); return 1;
         }
     }
@@ -767,7 +833,7 @@ int main(int argc, char **argv)
 
     bpf_map__set_max_entries(skel->maps.rb,
                              (uint32_t)cfg.ring_buffer_kb * 1024);
-    configure_programs(skel, cfg.filter.event_mask, cfg.follow_pid);
+    configure_programs(skel, cfg.filter.event_mask, cfg.follow_pid, cfg.lsm_deny);
 
     err = argus_bpf__load(skel);
     if (err) {
@@ -776,7 +842,7 @@ int main(int argc, char **argv)
     }
 
     setup_bpf_filters(skel, &cfg.filter, cfg.rate_limit_per_comm,
-                      cfg.rate_limit_per_pid, cfg.follow_pid);
+                      cfg.rate_limit_per_pid, cfg.follow_pid, cfg.lsm_deny);
 
     err = argus_bpf__attach(skel);
     if (err) {
@@ -805,6 +871,51 @@ int main(int argc, char **argv)
         fim_init(
             (const char (*)[256])cfg.fim_paths,
             cfg.fim_path_count);
+
+    /* Initialise canary / honeypot file detection */
+    canary_init();
+    for (int i = 0; i < cfg.canary_path_count; i++)
+        canary_add_path(cfg.canary_paths[i]);
+    if (cfg.canary_path_count > 0)
+        fprintf(stderr, "info: monitoring %d canary path(s)\n",
+                cfg.canary_path_count);
+
+    /* Initialise alert deduplication */
+    if (cfg.alert_dedup_secs > 0) {
+        dedup_init(cfg.alert_dedup_secs);
+        fprintf(stderr, "info: alert dedup window: %d seconds\n",
+                cfg.alert_dedup_secs);
+    }
+
+    /* Initialise C2 beaconing detector */
+    if (cfg.beacon_cv_threshold > 0.0) {
+        beacon_init(cfg.beacon_cv_threshold);
+        fprintf(stderr, "info: beacon detection CV threshold: %.2f\n",
+                cfg.beacon_cv_threshold);
+    }
+
+    /* Initialise syscall sequence detector */
+    seqdetect_init();
+
+    /* Initialise YARA scanner */
+    if (cfg.yara_rules_dir[0]) {
+        if (yara_scan_init(cfg.yara_rules_dir) == 0)
+            fprintf(stderr, "info: YARA rules loaded from %s\n",
+                    cfg.yara_rules_dir);
+        else if (!yara_scan_available())
+            fprintf(stderr, "warning: --yara-rules specified but argus "
+                            "was built without libyara support\n");
+    }
+
+    /* LSM enforcement status */
+    if (cfg.lsm_deny) {
+        if (bpf_lsm_supported())
+            fprintf(stderr, "info: LSM enforcement mode active "
+                            "(kernel_rules enforced in-kernel)\n");
+        else
+            fprintf(stderr, "warning: --lsm-deny requested but kernel "
+                            "does not support BPF LSM — enforcement disabled\n");
+    }
 
     /* Configure cgroup-aware baseline */
     if (cfg.baseline_cgroup_aware)
@@ -858,7 +969,7 @@ int main(int argc, char **argv)
                 cfg_load(cfg_home_path, &new_cfg);
             /* Preserve follow_pid — it's a startup-time CLI option */
             setup_bpf_filters(skel, &new_cfg.filter, new_cfg.rate_limit_per_comm,
-                              new_cfg.rate_limit_per_pid, cfg.follow_pid);
+                              new_cfg.rate_limit_per_pid, cfg.follow_pid, new_cfg.lsm_deny);
             output_update_filter(&new_cfg.filter);
             cfg.filter              = new_cfg.filter;
             cfg.rate_limit_per_comm = new_cfg.rate_limit_per_comm;

@@ -2,7 +2,7 @@
 
 A lightweight Linux kernel telemetry and threat-detection tool built on eBPF. Traces 21 event types system-wide — process execution, file access, network connections, privilege escalation, memory execution, kernel-module loading, namespace escapes, DNS queries, TLS SNI extraction, and more — with minimal overhead. Every event carries full process ancestry (`systemd→sshd→bash→curl`) and the container cgroup name for immediate container attribution.
 
-**Version 0.2.0** — Adds 12 new kernel-traced event types, active response (BPF kill), threat-intel feed integration, file integrity monitoring, LD_PRELOAD detection, DGA/C2 entropy detection, DNS→IP correlation, per-PID rate limiting, Prometheus metrics, cgroup-aware baselines, rolling baseline merge, alert suppression, process-ancestry rule matching, and a fleet aggregation server.
+**Version 0.2.0** — Adds 12 new kernel-traced event types, active response (BPF kill), threat-intel feed integration, file integrity monitoring, LD_PRELOAD detection, DGA/C2 entropy detection, DNS→IP correlation, per-PID rate limiting, Prometheus metrics, cgroup-aware baselines, rolling baseline merge, alert suppression, process-ancestry rule matching, fleet aggregation server, canary/honeypot file detection, alert deduplication, process hollowing detection, C2 beaconing detection, syscall attack-chain detection, YARA scanning, fleet correlation engine, and LSM BPF enforcement mode.
 
 ## Requirements
 
@@ -22,6 +22,7 @@ sudo dnf install -y clang llvm libbpf-devel elfutils-libelf-devel zlib-devel \
 ```
 
 OpenSSL (`libssl-dev`) is optional — argus builds without it; `--forward-tls` becomes a no-op.
+YARA (`libyara-dev`) is optional — argus builds without it; `--yara-rules` becomes a no-op (detected automatically via `pkg-config`).
 Seccomp is always available on Linux kernels ≥ 3.5 (detected automatically from the kernel headers).
 
 Verify BTF is available on your kernel:
@@ -141,6 +142,11 @@ sudo ./argus [OPTIONS]
 | `--ldpreload-check` | Scan `/proc/<pid>/environ` on EXEC events for LD_PRELOAD/LD_LIBRARY_PATH injection |
 | `--tls-sni` | Enable TLS ClientHello SNI extraction via uprobe on SSL_write (requires OpenSSL) |
 | `--response-kill` | Allow alert rules with `"action": "kill"` to terminate matched processes via BPF |
+| `--canary <path>` | Honeypot file path; any access (open/exec/unlink/rename) triggers a `[CANARY]` alert (repeatable) |
+| `--alert-dedup <secs>` | Suppress duplicate alerts with the same key within N seconds (0 = off) |
+| `--beacon-cv <f>` | Alert when a PID's CONNECT interval coefficient of variation falls below this value (e.g. 0.15; 0 = off) |
+| `--yara-rules <dir>` | Directory of `.yar` files to scan on EXEC, WRITE_CLOSE, and KMOD_LOAD events (requires libyara) |
+| `--lsm-deny` | Enable LSM BPF enforcement: kernel rules matching file open, exec, or connect are denied in-kernel (requires kernel 5.7+ with BPF LSM) |
 
 ### Observability
 
@@ -211,6 +217,21 @@ sudo ./argus --output-fmt cef --output /var/log/argus/events.cef
 
 # Reload config without restarting
 sudo kill -HUP $(pidof argus)
+
+# Honeypot files — alert on any access to canary paths
+sudo ./argus --canary /etc/argus/.canary --canary /tmp/.honeypot
+
+# Suppress duplicate alerts within a 30-second window
+sudo ./argus --alert-dedup 30 --rules /etc/argus/rules.json
+
+# Detect C2 beaconing by regular CONNECT intervals (CV < 0.15)
+sudo ./argus --events CONNECT --beacon-cv 0.15 --json
+
+# Scan executed binaries with YARA rules
+sudo ./argus --events EXEC --yara-rules /etc/argus/yara/
+
+# LSM BPF enforcement: deny kernel-rule-matched file opens and execs in-kernel
+sudo ./argus --lsm-deny --rules /etc/argus/rules.json
 ```
 
 ## Event Types
@@ -351,7 +372,11 @@ Argus loads `/etc/argus/config.json` then `~/.config/argus/config.json` on start
     "tls_sni_enable": false,
     "response_kill": false,
     "metrics_port": 0,
-    "yara_rules_dir": ""
+    "yara_rules_dir": "",
+    "canary_paths": ["/etc/argus/.canary", "/tmp/.honeypot"],
+    "alert_dedup_secs": 0,
+    "beacon_cv_threshold": 0.0,
+    "lsm_deny": false
 }
 ```
 
@@ -360,6 +385,10 @@ Argus loads `/etc/argus/config.json` then `~/.config/argus/config.json` on start
 `"baseline_merge_after"` auto-merges an anomaly into the baseline after it is seen N times (0 = disabled).
 `"dga_entropy_threshold"` fires a warning when a DNS query name's Shannon entropy exceeds this value (0.0 = disabled).
 `"response_kill"` must be `true` for `"action": "kill"` rules to take effect (safety gate).
+`"canary_paths"` lists honeypot file paths; any access fires a `[CANARY]` alert.
+`"alert_dedup_secs"` suppresses repeated alerts with the same key within N seconds (0 = off).
+`"beacon_cv_threshold"` fires a `[BEACON]` alert when a PID's CONNECT interval coefficient of variation falls below this value (0.0 = off).
+`"lsm_deny"` enables in-kernel denial of kernel-rule-matched opens, execs, and connects via LSM BPF hooks (requires kernel 5.7+ with `CONFIG_BPF_LSM=y`; silently skipped if unsupported).
 
 ## Kernel-side filtering
 
@@ -402,6 +431,109 @@ Changes are also emitted as JSON alerts if `--json` is active. Use this to detec
 ```
 
 This catches rootkit injection techniques that abuse `LD_PRELOAD`, `LD_LIBRARY_PATH`, and interpreter path overrides before the target process has a chance to run.
+
+## Canary / honeypot file detection
+
+`--canary <path>` (repeatable) registers a honeypot file path. Any process that opens, executes, reads, unlinks, or renames a canary path triggers an immediate alert regardless of other filters:
+
+```
+[CANARY] pid=8801 comm=bash path=/etc/argus/.canary (OPEN)
+[CANARY] pid=9102 comm=python3 path=/tmp/.honeypot (EXEC)
+```
+
+Canary paths ending with `/` match any file under that directory. Use this to detect lateral movement, unauthorized credential harvesting, or ransomware that scans directories indiscriminately.
+
+## Alert deduplication
+
+`--alert-dedup <secs>` deduplicates all detection-module alerts (CANARY, HOLLOW, BEACON, SEQDETECT, ANOMALY, YARA) within a rolling time window. Duplicate alerts with the same key are suppressed until the window expires:
+
+```sh
+# Suppress same alert for 60 seconds
+sudo ./argus --alert-dedup 60 --rules /etc/argus/rules.json
+```
+
+The dedup table holds 512 entries with linear-probe eviction. On table exhaustion it fails open (alerts pass through) rather than silently suppressing novel events.
+
+## Process hollowing detection
+
+On every `EXEC` event, argus compares the executable file from the kernel event (`ev->filename`) against the first executable memory mapping in `/proc/<pid>/maps`. A mismatch indicates the process image was replaced after exec (process hollowing):
+
+```
+[HOLLOW] pid=4512 comm=nginx exe=/usr/sbin/nginx maps=/tmp/.injected
+[HOLLOW] pid=7001 comm=python3 fileless execution (memfd or deleted)
+```
+
+Known interpreters (`bash`, `python*`, `perl`, `ruby`, `node`) that legitimately differ from their first mapping are excluded. Fileless execution (empty `exe` or paths containing `memfd:`) is also caught.
+
+## C2 beaconing detection
+
+`--beacon-cv <f>` tracks CONNECT events per (PID, destination IP, port). After collecting at least 5 samples in a 300-second window, argus computes the coefficient of variation (CV = stddev / mean) of the inter-arrival intervals. Highly regular beaconing has a low CV:
+
+```
+[BEACON] pid=8801 comm=updater dest=198.51.100.5:443 cv=0.04 (n=12)
+```
+
+Typical legitimate traffic has CV > 0.5. Beaconing malware often achieves CV < 0.1. Start with `--beacon-cv 0.15`. Up to 1024 (PID, destination) pairs are tracked simultaneously.
+
+## Syscall attack-chain detection
+
+Argus tracks cross-event attack sequences per PID using a state machine with a 10-second expiry window. Four chains are detected:
+
+| Chain | Trigger sequence | Alert tag |
+|---|---|---|
+| Shellcode injection | `MEMEXEC` → `EXEC` | `SHELLCODE_INJECT` |
+| Ptrace code injection | `PTRACE` (write/pokedata) → `EXEC` | `PTRACE_INJECT` |
+| Privilege escalation to shell | `PRIVESC` → `EXEC` of shell binary | `PRIVESC_SHELL` |
+| Namespace escape | `NS_ESCAPE` → `EXEC` | `NS_ESCAPE_EXEC` |
+
+```
+[SEQDETECT] pid=5501 comm=loader chain=SHELLCODE_INJECT (MEMEXEC→EXEC)
+[SEQDETECT] pid=3302 comm=exploit chain=PRIVESC_SHELL (PRIVESC→/bin/sh)
+```
+
+## YARA scanning
+
+`--yara-rules <dir>` loads all `.yar` files from a directory and scans file contents on `EXEC`, `WRITE_CLOSE`, and `KMOD_LOAD` events:
+
+```
+[YARA] pid=7001 comm=loader file=/tmp/payload rule=Mirai_Variant (tags: malware,botnet)
+[YARA] pid=5501 comm=insmod file=/tmp/evil.ko rule=Rootkit_Generic
+```
+
+Files larger than 64 MB are skipped. YARA is auto-detected at build time via `pkg-config`; if libyara is not installed, `--yara-rules` is accepted but produces a warning.
+
+```sh
+# Install libyara on Ubuntu
+sudo apt-get install -y libyara-dev
+
+# Write a simple rule
+cat > /etc/argus/yara/mirai.yar <<'EOF'
+rule Mirai_Strings {
+    strings:
+        $a = "/proc/net/tcp" ascii
+        $b = "GETLOCALIP" ascii
+    condition:
+        all of them
+}
+EOF
+
+sudo ./argus --yara-rules /etc/argus/yara/ --events EXEC
+```
+
+## LSM BPF enforcement mode
+
+`--lsm-deny` enables in-kernel enforcement via BPF LSM hooks. When active, any event that matches a kernel drop rule is **denied at the syscall level** before it executes — not just logged:
+
+- `lsm/file_open` — denies `open()`/`openat()` calls matching kernel rules
+- `lsm/bprm_check_security` — denies `execve()`/`execveat()` matching kernel rules
+- `lsm/socket_connect` — denies `connect()` to blocked destinations
+
+```sh
+# Deny all execs by UID 1001 at the kernel level
+sudo ./argus --lsm-deny --rules /etc/argus/rules.json
+```
+
+Requires kernel 5.7+ with `CONFIG_BPF_LSM=y` and `bpf` listed in `/sys/kernel/security/lsm`. If the kernel does not support BPF LSM, `--lsm-deny` is accepted but the LSM programs are silently disabled and a warning is printed at startup.
 
 ## DNS correlation and DGA detection
 
@@ -636,6 +768,26 @@ sudo ./argus --forward aggregator.internal:9000 --json
 
 The aggregator adds `"host": "<sender-IP>"` to each event JSON object and writes them to stdout as NDJSON, making it easy to pipe into a log shipper, Kafka topic, or Elasticsearch ingest pipeline.
 
+### Fleet correlation engine
+
+`argus-server` also performs cross-host IOC correlation. When the same indicator (IP:port, filename, or comm) is seen from ≥ N distinct hosts within a sliding time window, a `FLEET_CORR` alert is injected into the output stream:
+
+```sh
+# Alert when the same IOC appears from 3+ hosts within 60 seconds (defaults)
+./argus-server --port 9000 --correlate-threshold 3 --correlate-window 60
+```
+
+```json
+{"type":"FLEET_CORR","ioc":"198.51.100.5:4444","hosts":["10.0.0.1","10.0.0.2","10.0.0.3"],"count":3,"window_secs":60}
+```
+
+| Option | Description |
+|---|---|
+| `--correlate-window <secs>` | Sliding window for correlation (default: 60) |
+| `--correlate-threshold <n>` | Minimum distinct hosts to trigger alert (default: 3) |
+
+IOC keys are extracted automatically by event type: CONNECT/THREAT_INTEL → `IP:port`; EXEC/OPEN/WRITE_CLOSE/UNLINK/KMOD_LOAD → `filename`; PRIVESC/NS_ESCAPE/PTRACE → `comm`.
+
 ## Output modes
 
 | Flag | Description |
@@ -757,7 +909,7 @@ make test-asan
 make test-integration
 ```
 
-Unit tests cover: filter logic, lineage cache, alert rules (including suppression/threshold), TCP forwarding, baseline/anomaly module (including rolling merge), Prometheus metrics, FIM, and DNS/threat-intel correlation — **227 tests** across 8 test binaries.
+Unit tests cover: filter logic, lineage cache, alert rules (including suppression/threshold), TCP forwarding, baseline/anomaly module (including rolling merge), Prometheus metrics, FIM, and DNS/threat-intel correlation — **227 tests** across 8 test binaries. Integration tests cover 17 filter scenarios including `--pid`, `--comm`, event-type masking, rate limiting, forwarding, FIM, rules, and `--follow` PID subtree tracking.
 
 ## Performance tuning
 
@@ -824,9 +976,11 @@ limactl show-ssh --format config argus >> ~/.ssh/config
 
 ```
 argus.bpf.c          eBPF kernel programs — all 21 event types; BPF maps for kill list,
-                       threat-intel LPM trie, rate limiting, per-syscall scratch buffers
+                       threat-intel LPM trie, rate limiting, per-syscall scratch buffers;
+                       LSM hooks for in-kernel enforcement (file_open, bprm_check, socket_connect)
 argus.c              Userspace loader, ring buffer consumer, CLI, DNS correlation cache,
-                       DGA entropy detection, LD_PRELOAD check dispatch, FIM dispatch
+                       DGA entropy detection, LD_PRELOAD check dispatch, FIM dispatch,
+                       canary/hollow/beacon/seqdetect/yara dispatch
 output.c/h           Text, JSON, CEF, and syslog formatting for all 21 event types;
                        filtering; summary mode; uid→username enrichment
 rules.c/h            Alert rule engine: JSON loading, field matching (incl. parent_comm,
@@ -841,8 +995,16 @@ metrics.c/h          Prometheus metrics HTTP endpoint (background pthread)
 seccomp.c/h          Seccomp BPF denylist: blocks exec/fork/ptrace/setuid after priv-drop
 lineage.c/h          Userspace process ancestry cache; parent_comm/ancestor_comm queries
 config.c/h           JSON config file parser
-argus.h              Shared event struct, 21 type definitions, TRACE_* bitmasks
-argus-server.c       Fleet aggregator: multi-sensor TCP receiver with host field injection
+canary.c/h           Honeypot file detection: exact-path and prefix matching across event types
+dedup.c/h            Alert deduplication: 512-slot hash table with per-key time window
+hollow.c/h           Process hollowing detection: exe vs. maps comparison, fileless execution
+beacon.c/h           C2 beaconing detection: per-(pid,dest) CV of CONNECT inter-arrivals
+seqdetect.c/h        Syscall attack-chain detection: MEMEXEC→EXEC, PTRACE→EXEC, etc.
+yara_scan.c/h        YARA rule scanning on EXEC, WRITE_CLOSE, KMOD_LOAD (optional libyara)
+argus.h              Shared event struct, 21 type definitions, TRACE_* bitmasks,
+                       kernel_rule_t and argus_config_t shared between BPF and userspace
+argus-server.c       Fleet aggregator: multi-sensor TCP receiver, host field injection,
+                       cross-host IOC correlation engine (FLEET_CORR alerts)
 argus.8              Man page
 argus.spec           RPM spec file (make rpm)
 argus.service        systemd service unit

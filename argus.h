@@ -141,7 +141,7 @@ typedef struct argus_config {
     uint8_t  filter_pid_active;    /* 1 = only pass PIDs in filter_pids      */
     uint8_t  filter_comm_active;   /* 1 = only pass comms in filter_comms    */
     uint8_t  filter_follow_active; /* 1 = pass PIDs in follow_pids tree      */
-    uint8_t  pad[1];
+    uint8_t  lsm_deny_active;      /* 1 = LSM hooks enforce kernel_rules     */
     uint32_t rate_limit_per_comm;  /* 0 = disabled; N = max events/sec/comm  */
     uint32_t rate_limit_per_pid;   /* 0 = disabled; N = max events/sec/pid   */
 } argus_config_t;
