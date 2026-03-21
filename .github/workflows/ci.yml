@@ -65,16 +65,20 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             linux-tools-$(uname -r) 2>/dev/null || true
 
-          # Find the newest bpftool binary under /usr/lib/linux-tools
-          BPFTOOL=$(find /usr/lib/linux-tools /usr/sbin /usr/bin /usr/local/bin \
-                         -name bpftool 2>/dev/null | sort -t- -k1,1V | tail -1)
+          # Find a working bpftool binary (skip wrapper scripts that exit non-zero)
+          BPFTOOL=""
+          for candidate in $(find /usr/lib/linux-tools -name bpftool 2>/dev/null | sort -t- -k1,1V); do
+            if "$candidate" version >/dev/null 2>&1; then
+              BPFTOOL="$candidate"
+            fi
+          done
           if [ -z "$BPFTOOL" ]; then
-            echo "bpftool not found for kernel $(uname -r) — skipping integration tests"
+            echo "No working bpftool for kernel $(uname -r) — skipping integration tests"
             echo "found=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           sudo ln -sf "$BPFTOOL" /usr/local/bin/bpftool
-          bpftool --version
+          bpftool version
           echo "found=true" >> "$GITHUB_OUTPUT"
 
       - name: Verify BTF support
