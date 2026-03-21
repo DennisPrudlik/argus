@@ -48,4 +48,12 @@ int  rules_count(void);
 /* Unload all rules */
 void rules_free(void);
 
+/*
+ * Pass the file descriptor of the kill_list BPF hash map.
+ * When a rule with action="kill" matches, the event's PID is written into
+ * this map so the BPF program can send SIGKILL on the next syscall.
+ * Call after BPF attach. fd=-1 disables the feature (default).
+ */
+void rules_set_kill_fd(int fd);
+
 #endif /* __RULES_H */

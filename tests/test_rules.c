@@ -371,6 +371,190 @@ static void test_rules_free(void)
     unlink(path);
 }
 
+/* ── test: threshold_count — alert fires only after N hits ───────────────── */
+
+/* Count how many lines are written to a file by rules_check() */
+static int count_alerts(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    int n = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] != '\0' && line[0] != '\n') n++;
+    }
+    fclose(f);
+    return n;
+}
+
+static void test_threshold_count(void)
+{
+    /* Rule fires only after 3 hits (threshold_count=3, no window) */
+    char *rules_path = write_rules_file(
+        "[{\"name\":\"thresh3\",\"type\":\"EXEC\","
+        " \"threshold_count\":3,"
+        " \"message\":\"exec alert\"}]");
+    rules_free();
+    rules_load(rules_path);
+
+    char out_path[64];
+    snprintf(out_path, sizeof(out_path), "/tmp/argus_thresh_%d.txt", (int)getpid());
+    FILE *out = fopen(out_path, "w");
+    ASSERT_TRUE(out != NULL);
+    output_init(OUTPUT_JSON, NULL);
+    output_set_file(out);
+
+    event_t e = make_exec(1, "bash", "/bin/bash");
+
+    /* Hits 1 and 2 — below threshold, no alert */
+    rules_check(&e);
+    rules_check(&e);
+    fflush(out);
+    ASSERT_EQ(count_alerts(out_path), 0);
+
+    /* Hit 3 — threshold met, alert fires */
+    rules_check(&e);
+    fflush(out);
+    ASSERT_EQ(count_alerts(out_path), 1);
+
+    /* Hit 4 — threshold already met; with no suppress_after, fires again */
+    rules_check(&e);
+    fflush(out);
+    ASSERT_EQ(count_alerts(out_path), 2);
+
+    output_set_file(NULL);
+    fclose(out);
+    unlink(out_path);
+    unlink(rules_path);
+    rules_free();
+}
+
+/* ── test: suppress_after_secs — mute after threshold ───────────────────── */
+
+static void test_suppress_after(void)
+{
+    /* threshold=1 (always matches), suppress for 60 seconds after first hit */
+    char *rules_path = write_rules_file(
+        "[{\"name\":\"supp\",\"type\":\"EXEC\","
+        " \"suppress_after_secs\":60,"
+        " \"message\":\"exec\"}]");
+    rules_free();
+    rules_load(rules_path);
+
+    char out_path[64];
+    snprintf(out_path, sizeof(out_path), "/tmp/argus_supp_%d.txt", (int)getpid());
+    FILE *out = fopen(out_path, "w");
+    ASSERT_TRUE(out != NULL);
+    output_init(OUTPUT_JSON, NULL);
+    output_set_file(out);
+
+    event_t e = make_exec(1, "bash", "/bin/bash");
+
+    /* First hit — fires and arms suppression */
+    rules_check(&e);
+    fflush(out);
+    ASSERT_EQ(count_alerts(out_path), 1);
+
+    /* Second hit within the suppression window — must NOT fire */
+    rules_check(&e);
+    rules_check(&e);
+    fflush(out);
+    ASSERT_EQ(count_alerts(out_path), 1);
+
+    output_set_file(NULL);
+    fclose(out);
+    unlink(out_path);
+    unlink(rules_path);
+    rules_free();
+}
+
+/* ── test: threshold_count=3 + suppress_after_secs ──────────────────────── */
+
+static void test_threshold_then_suppress(void)
+{
+    /* fire after 3 hits, then suppress for 60 s */
+    char *rules_path = write_rules_file(
+        "[{\"name\":\"ts\",\"type\":\"EXEC\","
+        " \"threshold_count\":3,"
+        " \"suppress_after_secs\":60,"
+        " \"message\":\"alert\"}]");
+    rules_free();
+    rules_load(rules_path);
+
+    char out_path[64];
+    snprintf(out_path, sizeof(out_path), "/tmp/argus_ts_%d.txt", (int)getpid());
+    FILE *out = fopen(out_path, "w");
+    ASSERT_TRUE(out != NULL);
+    output_init(OUTPUT_JSON, NULL);
+    output_set_file(out);
+
+    event_t e = make_exec(1, "nc", "/usr/bin/nc");
+
+    /* Hits 1+2: below threshold */
+    rules_check(&e);
+    rules_check(&e);
+    fflush(out);
+    ASSERT_EQ(count_alerts(out_path), 0);
+
+    /* Hit 3: threshold met — fires once */
+    rules_check(&e);
+    fflush(out);
+    ASSERT_EQ(count_alerts(out_path), 1);
+
+    /* Hits 4+5: suppressed */
+    rules_check(&e);
+    rules_check(&e);
+    fflush(out);
+    ASSERT_EQ(count_alerts(out_path), 1);
+
+    output_set_file(NULL);
+    fclose(out);
+    unlink(out_path);
+    unlink(rules_path);
+    rules_free();
+}
+
+/* ── test: rules_free resets suppression state ───────────────────────────── */
+
+static void test_free_resets_suppression(void)
+{
+    char *rules_path = write_rules_file(
+        "[{\"name\":\"s\",\"type\":\"EXEC\","
+        " \"suppress_after_secs\":3600,"
+        " \"message\":\"x\"}]");
+    rules_free();
+    rules_load(rules_path);
+
+    char out_path[64];
+    snprintf(out_path, sizeof(out_path), "/tmp/argus_frs_%d.txt", (int)getpid());
+    FILE *out = fopen(out_path, "w");
+    output_init(OUTPUT_JSON, NULL);
+    output_set_file(out);
+
+    event_t e = make_exec(1, "bash", "/bin/bash");
+    rules_check(&e);   /* fires + suppresses */
+    fflush(out);
+    ASSERT_EQ(count_alerts(out_path), 1);
+
+    rules_check(&e);   /* suppressed */
+    fflush(out);
+    ASSERT_EQ(count_alerts(out_path), 1);
+
+    /* Reload rule — state reset */
+    rules_free();
+    rules_load(rules_path);
+
+    rules_check(&e);   /* fires again (state cleared) */
+    fflush(out);
+    ASSERT_EQ(count_alerts(out_path), 2);
+
+    output_set_file(NULL);
+    fclose(out);
+    unlink(out_path);
+    unlink(rules_path);
+    rules_free();
+}
+
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -387,6 +571,12 @@ int main(void)
     test_message_template();
     test_json_alert_output();
     test_rules_free();
+
+    /* suppression / threshold */
+    test_threshold_count();
+    test_suppress_after();
+    test_threshold_then_suppress();
+    test_free_resets_suppression();
 
     TEST_SUMMARY();
 }

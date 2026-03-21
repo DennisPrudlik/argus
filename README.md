@@ -1,6 +1,8 @@
 # Argus
 
-A lightweight Linux kernel telemetry tool built on eBPF. Traces process execution, file opens, network connections, file deletions/renames/permission changes, socket binds, and ptrace calls system-wide with minimal overhead. Every event carries process ancestry (`systemd→sshd→bash→curl`) and the container cgroup name for immediate container attribution.
+A lightweight Linux kernel telemetry and threat-detection tool built on eBPF. Traces 21 event types system-wide — process execution, file access, network connections, privilege escalation, memory execution, kernel-module loading, namespace escapes, DNS queries, TLS SNI extraction, and more — with minimal overhead. Every event carries full process ancestry (`systemd→sshd→bash→curl`) and the container cgroup name for immediate container attribution.
+
+**Version 0.2.0** — Adds 12 new kernel-traced event types, active response (BPF kill), threat-intel feed integration, file integrity monitoring, LD_PRELOAD detection, DGA/C2 entropy detection, DNS→IP correlation, per-PID rate limiting, Prometheus metrics, cgroup-aware baselines, rolling baseline merge, alert suppression, process-ancestry rule matching, and a fleet aggregation server.
 
 ## Requirements
 
@@ -11,11 +13,16 @@ A lightweight Linux kernel telemetry tool built on eBPF. Traces process executio
 
 ```sh
 # Ubuntu / Debian
-sudo apt-get install -y clang llvm libbpf-dev libelf-dev zlib1g-dev linux-tools-common linux-tools-generic
+sudo apt-get install -y clang llvm libbpf-dev libelf-dev zlib1g-dev \
+     linux-tools-common linux-tools-generic libssl-dev python3
 
 # Fedora / RHEL
-sudo dnf install -y clang llvm libbpf-devel elfutils-libelf-devel zlib-devel bpftool
+sudo dnf install -y clang llvm libbpf-devel elfutils-libelf-devel zlib-devel \
+     openssl-devel python3 bpftool
 ```
+
+OpenSSL (`libssl-dev`) is optional — argus builds without it; `--forward-tls` becomes a no-op.
+Seccomp is always available on Linux kernels ≥ 3.5 (detected automatically from the kernel headers).
 
 Verify BTF is available on your kernel:
 
@@ -31,13 +38,13 @@ cd argus
 make
 ```
 
-The build produces a single binary: `argus`.
+The build produces two binaries: `argus` (sensor) and `argus-server` (fleet aggregator).
 
 Build steps performed by `make`:
 1. Generates `vmlinux.h` from the running kernel's BTF via `bpftool`
 2. Compiles `argus.bpf.c` to a BPF ELF object with `clang`
 3. Generates `argus.skel.h` (libbpf skeleton) via `bpftool`
-4. Compiles the userspace loader `argus` with `gcc`
+4. Compiles the userspace loader `argus` and fleet server `argus-server` with `gcc`
 
 ### System-wide install
 
@@ -53,11 +60,11 @@ Build a native package for deployment on other machines:
 ```sh
 # Debian / Ubuntu (.deb) — requires dpkg-deb
 make deb
-# → argus_0.1.0_x86_64.deb
+# → argus_0.2.0_x86_64.deb
 
 # Fedora / RHEL (.rpm) — requires rpmbuild
 make rpm
-# → ~/rpmbuild/RPMS/.../argus-0.1.0-1.x86_64.rpm
+# → ~/rpmbuild/RPMS/.../argus-0.2.0-1.x86_64.rpm
 ```
 
 Both packages install the binary to `/usr/local/bin/argus` and include the systemd unit, tmpfiles.d config, and logrotate config.
@@ -80,6 +87,8 @@ The service writes JSON to `/var/log/argus/events.jsonl`, drops privileges to `n
 sudo ./argus [OPTIONS]
 ```
 
+### Core options
+
 | Option | Description |
 |---|---|
 | `--config <path>` | Load config file (see [Config file](#config-file)) |
@@ -88,22 +97,56 @@ sudo ./argus [OPTIONS]
 | `--comm <name>` | Only trace this process name (enforced in kernel) |
 | `--path <str>` | Only show file events whose path contains this string (userspace) |
 | `--exclude <pfx>` | Exclude file events (OPEN, UNLINK, RENAME, CHMOD) whose path starts with this prefix (repeatable) |
-| `--events <list>` | Comma-separated event types: `EXEC,OPEN,EXIT,CONNECT,UNLINK,RENAME,CHMOD,BIND,PTRACE` |
+| `--events <list>` | Comma-separated event types to enable (see [Event Types](#event-types)) |
 | `--rate-limit <n>` | Drop events after N per second per process name (0 = off, kernel-enforced) |
+| `--rate-limit-per-pid <n>` | Drop events after N per second per PID (0 = off, kernel-enforced) |
 | `--ringbuf <kb>` | Ring buffer size in KB (default: 256) |
 | `--summary <secs>` | Rolling summary every N seconds instead of per-event output |
 | `--output <path>` | Write event stream to file instead of stdout (opened in append mode) |
 | `--syslog` | Emit events to syslog (`LOG_DAEMON`) instead of stdout |
-| `--rules <path>` | Load alert rules from JSON file (see [Alert rules](#alert-rules)) |
-| `--forward <host:port>` | Stream JSON events to a remote TCP listener (see [Forwarding](#forwarding)) |
-| `--baseline <path>` | Detect anomalies against a learnt profile (see [Baseline mode](#baseline--anomaly-mode)) |
-| `--baseline-learn <secs>` | Learn a baseline profile for N seconds |
-| `--baseline-out <path>` | File to write the learnt baseline profile (default: `baseline.json`) |
-| `--json` | Emit newline-delimited JSON instead of a text table |
+| `--output-fmt <fmt>` | Output format: `text` (default), `json`, `syslog`, `cef` |
+| `--json` | Emit newline-delimited JSON (shorthand for `--output-fmt json`) |
+| `--pid-file <path>` | Write daemon PID to file; removed on exit |
 | `--no-drop-privs` | Stay root after attach (not recommended) |
 | `--config-check` | Validate config file(s) and print active settings, then exit |
 | `--version` | Print version and exit |
 | `--help` | Show usage |
+
+### Rules & forwarding
+
+| Option | Description |
+|---|---|
+| `--rules <path>` | Load alert rules from JSON file (see [Alert rules](#alert-rules)) |
+| `--forward <host:port>` | Stream JSON events to a remote TCP listener |
+| `--forward-tls` | Enable TLS for `--forward` with server certificate verification |
+| `--forward-tls-noverify` | Enable TLS for `--forward` without certificate verification |
+
+### Baseline & anomaly detection
+
+| Option | Description |
+|---|---|
+| `--baseline <path>` | Detect anomalies against a learnt profile |
+| `--baseline-learn <secs>` | Learn a baseline profile for N seconds |
+| `--baseline-out <path>` | File to write the learnt baseline profile (default: `baseline.json`) |
+| `--baseline-merge-after <n>` | Auto-merge anomalies into baseline after N sightings (0 = disabled) |
+| `--baseline-cgroup-aware` | Key baselines by `cgroup/comm` instead of `comm` alone |
+
+### Threat detection modules
+
+| Option | Description |
+|---|---|
+| `--threat-intel <path>` | Load CIDR blocklist file into BPF; matching connects become THREAT_INTEL events |
+| `--fim-paths <path>[,<path>...]` | File Integrity Monitoring: hash watched files at startup, alert on change |
+| `--dga-entropy-threshold <f>` | Alert on DNS names with Shannon entropy above this value (e.g. 3.5; 0 = off) |
+| `--ldpreload-check` | Scan `/proc/<pid>/environ` on EXEC events for LD_PRELOAD/LD_LIBRARY_PATH injection |
+| `--tls-sni` | Enable TLS ClientHello SNI extraction via uprobe on SSL_write (requires OpenSSL) |
+| `--response-kill` | Allow alert rules with `"action": "kill"` to terminate matched processes via BPF |
+
+### Observability
+
+| Option | Description |
+|---|---|
+| `--metrics-port <n>` | Expose Prometheus metrics on this TCP port (0 = disabled) |
 
 ### Examples
 
@@ -117,124 +160,141 @@ sudo ./argus --comm curl
 # Watch a specific PID and all its children recursively
 sudo ./argus --follow 1234
 
-# Watch a specific PID (no children)
-sudo ./argus --pid 1234
+# Security-focused: privilege escalation, memory execution, kernel modules, namespace escapes
+sudo ./argus --events PRIVESC,MEMEXEC,KMOD_LOAD,NS_ESCAPE --json
+
+# Load threat-intel blocklist and alert on matching connections
+sudo ./argus --threat-intel /etc/argus/blocklist.cidr --json
+
+# File integrity monitoring on critical paths
+sudo ./argus --fim-paths /etc/passwd,/etc/shadow,/etc/sudoers
+
+# Detect DNS-based C2 via high-entropy names (DGA)
+sudo ./argus --events DNS --dga-entropy-threshold 3.5 --json
+
+# Detect LD_PRELOAD injection on process starts
+sudo ./argus --events EXEC --ldpreload-check --json
+
+# Active response: kill matched processes
+sudo ./argus --rules /etc/argus/rules.json --response-kill
+
+# Expose Prometheus metrics for Grafana/Alertmanager
+sudo ./argus --metrics-port 9090
+
+# Cgroup-aware baselines (separate profile per container)
+sudo ./argus --baseline /etc/argus/baseline.json --baseline-cgroup-aware
+
+# Rolling baseline merge: auto-accept after 3 sightings
+sudo ./argus --baseline /etc/argus/baseline.json --baseline-merge-after 3
 
 # Watch file opens under /etc, excluding /proc and /sys noise
 sudo ./argus --events OPEN --path /etc --exclude /proc --exclude /sys
 
-# Security-focused: file deletions, permission changes, and process injection
-sudo ./argus --events UNLINK,RENAME,CHMOD,PTRACE --json
-
-# Detect server-side network binds
-sudo ./argus --events BIND --json | jq 'select(.lport < 1024)'
-
 # Limit noisy processes to 100 events/sec each
 sudo ./argus --rate-limit 100
 
-# Rolling 10-second summary
-sudo ./argus --summary 10
-
-# Only trace EXEC and CONNECT, JSON output
-sudo ./argus --events EXEC,CONNECT --json
+# Per-PID rate limit (useful when many instances of same binary run)
+sudo ./argus --rate-limit-per-pid 50
 
 # JSON output, pipe into jq
-sudo ./argus --json | jq 'select(.type == "EXEC")'
+sudo ./argus --json | jq 'select(.type == "PRIVESC")'
 
-# Show only container events (non-empty cgroup)
-sudo ./argus --json | jq 'select(.cgroup != "")'
-
-# Use a config file
-sudo ./argus --config /etc/argus/config.json
-
-# Reload config without restarting
-sudo kill -HUP $(pidof argus)
-
-# Write events to a persistent file instead of stdout
-sudo ./argus --json --output /var/log/argus/events.jsonl
-
-# Emit all events to syslog (daemon facility)
-sudo ./argus --syslog
-
-# Load alert rules and emit alerts to stderr (text) or inline (JSON)
-sudo ./argus --rules /etc/argus/rules.json --json
-
-# Combine: daemon mode with rules
-sudo ./argus --syslog --rules /etc/argus/rules.json
-
-# Forward all events to a remote SIEM over TCP
-sudo ./argus --forward siem.internal:9000 --json
-
-# Forward + local file copy simultaneously
-sudo ./argus --forward siem.internal:9000 --output /var/log/argus/events.jsonl --json
-
-# IPv6 receiver
-sudo ./argus --forward '[::1]:9000'
+# Forward all events to a remote SIEM over TLS
+sudo ./argus --forward siem.internal:9000 --forward-tls
 
 # Learn a baseline for 1 hour, then use it for anomaly detection
 sudo ./argus --baseline-learn 3600 --baseline-out /etc/argus/baseline.json
 sudo ./argus --baseline /etc/argus/baseline.json --json
+
+# CEF output for SIEM ingestion (Splunk, ArcSight, QRadar)
+sudo ./argus --output-fmt cef --output /var/log/argus/events.cef
+
+# Reload config without restarting
+sudo kill -HUP $(pidof argus)
 ```
+
+## Event Types
+
+### Kernel-traced events
+
+| Type | Tracepoints | Description | Key Fields |
+|---|---|---|---|
+| `EXEC` | `sys_{enter,exit}_execve`, `execveat` | Process execution | `filename`, `args`, `duration_ns` |
+| `OPEN` | `sys_{enter,exit}_openat` | File open | `filename`, `open_flags`, `success` |
+| `EXIT` | `sched_process_exit` | Process exit | `exit_code` |
+| `CONNECT` | `sys_{enter,exit}_connect` | Outbound TCP/UDP connection | `family`, `daddr`, `dport`, `success` |
+| `UNLINK` | `sys_{enter,exit}_unlinkat` | File deletion | `filename`, `success` |
+| `RENAME` | `sys_{enter,exit}_renameat2` | File rename | `filename` (old), `new_path`, `success` |
+| `CHMOD` | `sys_{enter,exit}_fchmodat` | Permission change | `filename`, `mode`, `success` |
+| `BIND` | `sys_{enter,exit}_bind` | Server socket bind | `family`, `laddr`, `lport`, `success` |
+| `PTRACE` | `sys_{enter,exit}_ptrace` | Process tracing/injection | `ptrace_req`, `target_pid`, `success` |
+| `DNS` | `sys_{enter,exit}_sendto` (port 53) | Outbound DNS query | `filename` (query name) |
+| `SEND` | `sys_{enter,exit}_sendto` | First 128 bytes of sendto payload | `mode` (payload len), `filename` (hex) |
+| `WRITE_CLOSE` | `sys_{enter,exit}_close` | close() on a write-mode fd | `filename` |
+| `PRIVESC` | `sys_{enter,exit}_setuid`, `setresuid`, `capset` | UID→0 or dangerous capability grant | `uid_before`, `uid_after`, `cap_data` |
+| `MEMEXEC` | `sys_{enter,exit}_mmap`, `mprotect` | PROT_EXEC on anonymous mapping | `mode` (prot flags) |
+| `KMOD_LOAD` | `sys_{enter,exit}_init_module`, `finit_module` | Kernel module load | `filename`, `target_pid` (fd) |
+| `NS_ESCAPE` | `sys_{enter,exit}_unshare`, `setns`, `clone` | Namespace isolation escape | `mode` (clone flags) |
+
+### Synthetic / userspace events
+
+| Type | Source | Description | Key Fields |
+|---|---|---|---|
+| `NET_CORR` | Userspace correlation | DNS→connect match (CONNECT to IP recently resolved via DNS) | `dns_name`, `daddr`, `dport` |
+| `RATE_LIMIT` | BPF | Per-comm or per-PID rate limit exceeded | `pid`, `comm` |
+| `THREAT_INTEL` | BPF LPM trie | CONNECT destination matched threat-intel CIDR blocklist | `daddr`, `dport`, `family` |
+| `TLS_SNI` | Uprobe `SSL_write` | TLS ClientHello SNI hostname extraction | `dns_name` (SNI), `daddr`, `dport` |
+| `PROC_SCRAPE` | `sys_{enter,exit}_openat` | `/proc/<pid>/mem`, `/maps`, or `/fd` opened by a foreign process | `filename`, `target_pid` |
+
+All events include: `pid`, `ppid`, `uid`, `gid`, `user` (username when resolvable), `comm`, `cgroup`, `lineage`, `duration_ns`.
+
+The `cgroup` field contains the leaf cgroup name. For Docker containers this is the container scope name (e.g. `docker-abc123.scope`); for Kubernetes pods it is the container ID. Empty string on host processes.
+
+`execveat(2)` is traced alongside `execve(2)` — both appear as `EXEC` events, so script interpreters that use the `execveat` path are fully captured.
 
 ## Output
 
 ### Text
 
 ```
-Tracing via eBPF (EXEC,OPEN,EXIT,CONNECT,UNLINK,RENAME,CHMOD,BIND,PTRACE)... Ctrl-C to stop.
+Tracing via eBPF (all events)... Ctrl-C to stop.
 
-TYPE   PID     PPID    UID   GID   COMM              CGROUP                    LINEAGE                           DETAIL
------  ------  ------  ----  ----  ----------------  ------------------------  --------------------------------  ------
-EXEC   3821    3820    1000  1000  curl              -                         systemd→sshd→bash                 /usr/bin/curl example.com
-OPEN   3821    3820    1000  1000  curl              -                         systemd→sshd→bash                 [OK] /etc/ssl/certs/ca-certificates.crt
-CONN   3821    3820    1000  1000  curl              -                         systemd→sshd→bash                 [OK] 93.184.216.34:443
-EXIT   3821    3820    1000  1000  curl              -                         systemd→sshd→bash                 exit_code=0
-UNLNK  4102    4100    0     0     rm                docker-abc123.scope       systemd→containerd→sh             [OK] /tmp/secret.key
-PTRC   8801    8800    0     0     gdb               -                         systemd→sshd→bash                 [OK] req=16 target_pid=3821
+TYPE      PID     PPID    UID   GID   COMM              CGROUP                    LINEAGE                           DETAIL
+--------  ------  ------  ----  ----  ----------------  ------------------------  --------------------------------  ------
+EXEC      3821    3820    1000  1000  curl              -                         systemd→sshd→bash                 /usr/bin/curl example.com
+CONN      3821    3820    1000  1000  curl              -                         systemd→sshd→bash                 [OK] example.com (93.184.216.34):443
+DNS       3821    3820    1000  1000  curl              -                         systemd→sshd→bash                 example.com
+NET_CORR  3821    3820    1000  1000  curl              -                         systemd→sshd→bash                 example.com → 93.184.216.34:443
+PRIVESC   1024    1023    1000  1000  sudo              -                         systemd→sshd→bash                 uid 1000→0
+MEMEXEC   4512    4511    0     0     malware           -                         systemd→bash                      mmap PROT_EXEC anon
+KMOD_LOAD 5001    5000    0     0     insmod            -                         systemd→bash                      /tmp/evil.ko
+NS_ESC    6012    6011    0     0     unshare           -                         systemd→bash                      CLONE_NEWUSER|CLONE_NEWNET
 ```
 
-### JSON (`--json`)
+### JSON (`--json` / `--output-fmt json`)
 
-One object per line, suitable for `jq`, log shippers, or SIEMs:
+One object per line, suitable for `jq`, log shippers, or SIEMs.
 
 ```json
-{"type":"EXEC","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"comm":"curl","cgroup":"","lineage":"systemd→sshd→bash","duration_ns":41238,"success":true,"filename":"/usr/bin/curl","args":"example.com"}
-{"type":"OPEN","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"comm":"curl","cgroup":"","lineage":"systemd→sshd→bash","duration_ns":9812,"success":true,"filename":"/etc/ssl/certs/ca-certificates.crt"}
-{"type":"CONNECT","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"comm":"curl","cgroup":"","lineage":"systemd→sshd→bash","duration_ns":2301,"success":true,"family":2,"daddr":"93.184.216.34","hostname":"example.com","dport":443}
-{"type":"EXIT","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"comm":"curl","cgroup":"","lineage":"systemd→sshd→bash","duration_ns":0,"success":true,"exit_code":0}
-{"type":"UNLINK","pid":4102,"ppid":4100,"uid":0,"gid":0,"comm":"rm","cgroup":"docker-abc123.scope","lineage":"systemd→containerd→sh","duration_ns":312,"success":true,"filename":"/tmp/secret.key"}
-{"type":"PTRACE","pid":8801,"ppid":8800,"uid":0,"gid":0,"comm":"gdb","cgroup":"","lineage":"systemd→sshd→bash","duration_ns":88,"success":true,"ptrace_req":16,"target_pid":3821}
+{"type":"EXEC","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"user":"alice","comm":"curl","cgroup":"","lineage":"systemd→sshd→bash","duration_ns":41238,"success":true,"filename":"/usr/bin/curl","args":"example.com"}
+{"type":"CONNECT","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"user":"alice","comm":"curl","cgroup":"","lineage":"systemd→sshd→bash","duration_ns":2301,"success":true,"family":2,"daddr":"93.184.216.34","hostname":"example.com","dport":443}
+{"type":"DNS","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"user":"alice","comm":"curl","cgroup":"","lineage":"systemd→sshd→bash","duration_ns":0,"success":true,"filename":"example.com"}
+{"type":"NET_CORR","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"user":"alice","comm":"curl","cgroup":"","lineage":"systemd→sshd→bash","dns_name":"example.com","daddr":"93.184.216.34","dport":443}
+{"type":"PRIVESC","pid":1024,"ppid":1023,"uid":1000,"gid":1000,"user":"alice","comm":"sudo","cgroup":"","lineage":"systemd→sshd→bash","uid_before":1000,"uid_after":0}
+{"type":"THREAT_INTEL","pid":8801,"ppid":8800,"uid":0,"gid":0,"user":"root","comm":"nc","cgroup":"","lineage":"systemd→bash","daddr":"198.51.100.5","dport":4444}
 ```
 
-If the ring buffer fills under load, a drop warning is emitted:
+### CEF (`--output-fmt cef`)
+
+ArcSight Common Event Format v0. Severity mapping: EXEC/OPEN/EXIT/CONNECT/BIND/DNS/SEND → 3 (Low), UNLINK/RENAME/CHMOD/WRITE_CLOSE/NET_CORR → 5 (Medium), PTRACE/MEMEXEC/PROC_SCRAPE → 8 (High), PRIVESC/KMOD_LOAD/THREAT_INTEL/NS_ESCAPE → 9 (Very High).
 
 ```
-[WARNING: 14 event(s) dropped — ring buffer full]
+CEF:0|argus|argus|0.2.0|PRIVESC|Privilege Escalation|9|spid=1024 suid=1000 sgid=1000 dproc=sudo suser=alice flexString1Label=lineage flexString1=systemd→sshd→bash cs2Label=uid_before cs2=1000 cs3Label=uid_after cs3=0
+CEF:0|argus|argus|0.2.0|KMOD_LOAD|Kernel Module Load|9|spid=5001 suid=0 sgid=0 dproc=insmod suser=root flexString1Label=lineage flexString1=systemd→bash fname=/tmp/evil.ko
+CEF:0|argus|argus|0.2.0|THREAT_INTEL|Threat Intel Match|9|spid=8801 suid=0 sgid=0 dproc=nc suser=root dst=198.51.100.5 dpt=4444
 ```
-
-In `--json` mode this appears inline as `{"type":"DROP","count":14}`.
-
-## Event Types
-
-| Type | Tracepoint | Key Fields |
-|---|---|---|
-| `EXEC` | `syscalls/sys_{enter,exit}_execve` | `filename`, `args`, `duration_ns` |
-| `OPEN` | `syscalls/sys_{enter,exit}_openat` | `filename`, `success`, `duration_ns` |
-| `EXIT` | `sched/sched_process_exit` | `exit_code` |
-| `CONNECT` | `syscalls/sys_{enter,exit}_connect` | `family`, `daddr`, `dport`, `success` |
-| `UNLINK` | `syscalls/sys_{enter,exit}_unlinkat` | `filename`, `success` |
-| `RENAME` | `syscalls/sys_{enter,exit}_renameat2` | `filename` (old), `new_path`, `success` |
-| `CHMOD` | `syscalls/sys_{enter,exit}_fchmodat` | `filename`, `mode`, `success` |
-| `BIND` | `syscalls/sys_{enter,exit}_bind` | `family`, `laddr`, `lport`, `success` |
-| `PTRACE` | `syscalls/sys_{enter,exit}_ptrace` | `ptrace_req`, `target_pid`, `success` |
-
-All events include: `pid`, `ppid`, `uid`, `gid`, `comm`, `cgroup`, `lineage`.
-
-The `cgroup` field contains the leaf cgroup name. For Docker containers this is the container scope name (e.g. `docker-abc123.scope`); for Kubernetes pods it is the container ID. Empty string on host processes.
 
 ### Summary mode (`--summary N`)
-
-Instead of per-event lines, print a rolling summary every N seconds:
 
 ```
 ════════════════════════════════════════════════════════
@@ -242,7 +302,9 @@ Instead of per-event lines, print a rolling summary every N seconds:
   EXEC      47  bash(21)  python3(14)  sh(12)
   OPEN    1823  nginx(891)  python3(512)  bash(420)
   CONNECT    9  curl(6)  wget(3)
-  EXIT      44
+  DNS       11  curl(7)  wget(4)
+  PRIVESC    2  sudo(2)
+  MEMEXEC    1  loader(1)
 ════════════════════════════════════════════════════════
 ```
 
@@ -257,68 +319,119 @@ Argus loads `/etc/argus/config.json` then `~/.config/argus/config.json` on start
     "comm": "",
     "path": "",
     "exclude_paths": ["/proc", "/sys", "/dev"],
-    "event_types": ["EXEC", "OPEN", "EXIT", "CONNECT", "UNLINK", "RENAME", "CHMOD", "BIND", "PTRACE"],
+    "event_types": ["EXEC", "OPEN", "EXIT", "CONNECT", "UNLINK", "RENAME", "CHMOD",
+                    "BIND", "PTRACE", "DNS", "SEND", "WRITE_CLOSE",
+                    "PRIVESC", "MEMEXEC", "KMOD_LOAD", "NS_ESCAPE"],
     "ring_buffer_kb": 256,
     "summary_interval": 0,
     "rate_limit_per_comm": 0,
+    "rate_limit_per_pid": 0,
     "output_path": "",
+    "output_fmt": "text",
+    "pid_file": "",
     "syslog": false,
     "rules": "",
     "forward": "",
+    "forward_tls": false,
+    "forward_tls_noverify": false,
+    "targets": [
+        {"addr": "siem1.corp:9000"},
+        {"addr": "siem2.corp:9001", "tls": true},
+        {"addr": "backup.corp:9002", "tls_noverify": true}
+    ],
     "baseline": "",
     "baseline_out": "",
-    "baseline_learn_secs": 0
+    "baseline_learn_secs": 0,
+    "baseline_merge_after": 0,
+    "baseline_cgroup_aware": false,
+    "threat_intel_path": "/etc/argus/blocklist.cidr",
+    "fim_paths": ["/etc/passwd", "/etc/shadow", "/etc/sudoers", "/etc/hosts"],
+    "dga_entropy_threshold": 0.0,
+    "ldpreload_check": false,
+    "tls_sni_enable": false,
+    "response_kill": false,
+    "metrics_port": 0,
+    "yara_rules_dir": ""
 }
 ```
 
-A config file is the recommended way to run argus as a persistent daemon — set `exclude_paths` to suppress `/proc`/`/sys` noise, `event_types` to limit which tracepoints are attached, and `rate_limit_per_comm` to prevent any single process from flooding the ring buffer. Changes take effect immediately on `SIGHUP` without restarting.
+`"output_fmt"` accepts `"text"`, `"json"`, `"syslog"`, or `"cef"`.
+`"targets"` adds up to 8 independent forwarding destinations alongside the single `"forward"` key.
+`"baseline_merge_after"` auto-merges an anomaly into the baseline after it is seen N times (0 = disabled).
+`"dga_entropy_threshold"` fires a warning when a DNS query name's Shannon entropy exceeds this value (0.0 = disabled).
+`"response_kill"` must be `true` for `"action": "kill"` rules to take effect (safety gate).
 
 ## Kernel-side filtering
 
-`--pid` and `--comm` filters are pushed into BPF maps before any programs attach. The kernel drops non-matching events before they reach the ring buffer — filtered runs have near-zero overhead even on noisy hosts. `--path` and `--exclude` are evaluated in userspace after delivery. `--events` prevents the unused BPF programs from loading entirely.
+`--pid`, `--comm`, and `--rate-limit` are pushed into BPF maps and enforced before events enter the ring buffer — near-zero overhead even on noisy hosts.
 
-`--rate-limit N` enforces a per-comm sliding-window token bucket inside the BPF programs: once a process name emits more than N events per second, further events from that comm are silently dropped until the next 1-second window opens. Useful to prevent a single noisy process (e.g. a busy web server) from saturating the ring buffer.
+`--rate-limit-per-pid` uses an LRU hash map keyed by PID so high-churn workloads (many short-lived processes) don't exhaust the map. Both per-comm and per-PID limits can be active simultaneously; the first limit hit wins.
 
-## PID subtree tracking (`--follow`)
+The **BPF kill list** (`--response-kill` + rule `"action": "kill"`) writes the target PID into a BPF hash map; every subsequent event from that PID triggers `bpf_send_signal(SIGKILL)` directly from the kernel, before the event reaches userspace.
 
-`--follow <pid>` traces a process and all its descendants — children, grandchildren, and so on — dynamically as they are spawned. The BPF `sched_process_fork` tracepoint propagates the tracked set: whenever a fork/clone is observed from a followed PID, the child is added to the `follow_pids` BPF map automatically. When a followed process exits, it is removed from the map.
+## Threat-intel feed
 
-This is useful for tracing the complete activity of a service tree without knowing all its PIDs in advance:
+`--threat-intel <path>` loads a plaintext CIDR blocklist (one prefix per line, `#` comments ignored) into a BPF LPM trie at startup:
 
-```sh
-# Trace nginx and every worker process it spawns
-sudo ./argus --follow $(pidof nginx | awk '{print $1}')
-
-# Trace a shell session and everything it runs
-sudo ./argus --follow $$
+```
+# Emerging threats feed
+192.0.2.0/24
+198.51.100.0/24
+203.0.113.128/25
 ```
 
-Unlike `--pid` (which is a static allowlist), `--follow` tracks process trees dynamically. Both can be combined: `--pid` for a static set, `--follow` for a subtree.
+When any `connect()` matches a listed prefix, the event is re-typed to `THREAT_INTEL` and receives severity 9 in CEF output. The BPF lookup happens before the ring buffer so there is no userspace round-trip on the hot path.
 
-## DNS reverse-lookup
+## File Integrity Monitoring (FIM)
 
-CONNECT and BIND events automatically include a reverse-DNS hostname lookup. Results are cached in a 512-entry table with a 300-second TTL so `getnameinfo()` is only called once per unique address per window.
+`--fim-paths` hashes each listed file with SHA-256 at startup. On every `WRITE_CLOSE` event whose filename matches a watched path, the file is re-hashed and compared:
 
-**Text output:**
 ```
-CONN   3821    3820    1000  1000  curl   -   systemd→bash   [OK] example.com (93.184.216.34):443
+[FIM] /etc/passwd hash changed: a1b2c3...→d4e5f6...
 ```
 
-**JSON output** — adds a `hostname` field next to `daddr`/`laddr`:
+Changes are also emitted as JSON alerts if `--json` is active. Use this to detect runtime tampering of credential files, sudo rules, or PAM config.
+
+## LD_PRELOAD detection
+
+`--ldpreload-check` reads `/proc/<pid>/environ` on every `EXEC` event and scans for suspicious injection variables:
+
+```
+[LD_PRELOAD] pid=8801 comm=bash LD_PRELOAD=/tmp/hook.so
+[LD_PRELOAD] pid=9012 comm=python3 PYTHONPATH=/tmp/evil
+```
+
+This catches rootkit injection techniques that abuse `LD_PRELOAD`, `LD_LIBRARY_PATH`, and interpreter path overrides before the target process has a chance to run.
+
+## DNS correlation and DGA detection
+
+### DNS → IP correlation
+
+When a `DNS` event is observed, argus caches the queried name with a 60-second TTL. When a subsequent `CONNECT` resolves to an IP from that cache, a synthetic `NET_CORR` event is emitted linking the domain name to the connection:
+
 ```json
-{"type":"CONNECT",...,"daddr":"93.184.216.34","hostname":"example.com","dport":443}
+{"type":"NET_CORR","comm":"malware","dns_name":"c2.evil.example","daddr":"198.51.100.5","dport":443}
 ```
 
-When reverse resolution fails (no PTR record), `hostname` equals the dotted-decimal address and the text output shows the IP only.
+This surfaces C2 connections that are otherwise visible only as raw IP connects.
+
+### DGA detection
+
+`--dga-entropy-threshold <f>` computes the Shannon entropy of every DNS query name. Names above the threshold are flagged:
+
+```
+[DGA] high-entropy DNS name: xf4k2mz9q1p.example.com (entropy=4.12)
+```
+
+Legitimate hostnames (e.g. `api.github.com`) typically score below 3.0. DGA-generated names typically score above 3.5.
 
 ## Baseline / anomaly mode
 
-Argus can learn the normal behaviour of each process name over a time window and then alert on deviations. This is useful for detecting unexpected outbound connections, new binaries executing under a web server, or unusual file access patterns.
+Argus learns the normal behaviour of each process and alerts on deviations.
 
 ### Learning
 
 ```sh
-# Learn for 1 hour and write the profile
 sudo ./argus --baseline-learn 3600 --baseline-out /etc/argus/baseline.json
 ```
 
@@ -326,6 +439,7 @@ The profile records per-comm:
 - `exec_targets` — filenames of every successful `execve`
 - `connect_dests` — `addr:port` pairs from every successful `connect`
 - `open_paths` — filenames of every successful `open`
+- `bind_ports` — local ports from every successful `bind`
 
 ### Detection
 
@@ -333,19 +447,266 @@ The profile records per-comm:
 sudo ./argus --baseline /etc/argus/baseline.json --json
 ```
 
-Each new event is checked against the learnt profile for its `comm`. If an EXEC target, CONNECT destination, or OPEN path has not been seen before, an anomaly alert is emitted:
+Anomaly alerts:
 
-**Text mode (stderr):**
+**Text mode:**
 ```
-[ANOMALY] comm=nginx           pid=4102    new_connect_dest: 198.51.100.5:4444
+[ANOMALY] comm=nginx pid=4102 new_connect_dest: 198.51.100.5:4444
 ```
 
-**JSON mode (inline):**
+**JSON mode:**
 ```json
 {"type":"ANOMALY","severity":"HIGH","comm":"nginx","pid":4102,"what":"new_connect_dest","value":"198.51.100.5:4444"}
 ```
 
-Baseline detection and alert rules run simultaneously — combine both for defence-in-depth.
+### Cgroup-aware baselines (`--baseline-cgroup-aware`)
+
+By default baselines key by `comm`. With `--baseline-cgroup-aware`, keys become `cgroup/comm` — each container gets its own profile, preventing cross-container baseline bleeding in multi-tenant environments.
+
+### Rolling merge (`--baseline-merge-after N`)
+
+An anomaly is automatically merged into the baseline after being seen N times. This handles legitimate but infrequent operations (nightly batch jobs, weekly certificate renewal) without requiring manual profile updates. Set to 0 to disable auto-merge and require explicit re-learning.
+
+## Alert rules
+
+Argus evaluates detection rules against every event and emits alerts for matches. Load rules with `--rules <path>`.
+
+### Rule file format
+
+```json
+[
+    {
+        "name":          "Privilege escalation",
+        "severity":      "critical",
+        "type":          "PRIVESC",
+        "message":       "{comm} (pid={pid}) escalated uid {uid_before}→{uid_after}"
+    },
+    {
+        "name":          "Anonymous memory execution",
+        "severity":      "critical",
+        "type":          "MEMEXEC",
+        "message":       "{comm} mapped anonymous executable memory"
+    },
+    {
+        "name":          "Kernel module load",
+        "severity":      "critical",
+        "type":          "KMOD_LOAD",
+        "message":       "{comm} (pid={pid}) loaded module: {filename}"
+    },
+    {
+        "name":          "Threat intel match — kill",
+        "severity":      "critical",
+        "type":          "THREAT_INTEL",
+        "action":        "kill",
+        "message":       "{comm} connected to blocklisted IP {daddr}:{dport}"
+    },
+    {
+        "name":          "Shell spawned by web server",
+        "severity":      "high",
+        "type":          "EXEC",
+        "comm":          "bash",
+        "parent_comm":   "nginx",
+        "message":       "web server spawned shell: {filename}"
+    },
+    {
+        "name":          "Suspicious shadow access",
+        "severity":      "high",
+        "path_contains": "/etc/shadow",
+        "message":       "{comm} (uid={uid}) accessed {filename}"
+    },
+    {
+        "name":          "Repeated brute-force — suppress after 5",
+        "severity":      "medium",
+        "type":          "CONNECT",
+        "comm":          "hydra",
+        "threshold_count":     5,
+        "threshold_window_secs": 60,
+        "suppress_after_secs": 300,
+        "message":       "brute force from {comm} to {daddr}:{dport}"
+    },
+    {
+        "name":          "World-writable chmod",
+        "severity":      "high",
+        "type":          "CHMOD",
+        "mode_mask":     2,
+        "message":       "{comm} made {filename} world-writable (mode=0{mode})"
+    }
+]
+```
+
+### Rule fields
+
+| Field | Type | Description |
+|---|---|---|
+| `name` | string | Rule name — required, shown in alert output |
+| `severity` | string | `info` \| `low` \| `medium` \| `high` \| `critical` |
+| `type` | string | Event type to match (any type from [Event Types](#event-types)); omit to match all |
+| `comm` | string | Exact process name match; omit to match any |
+| `parent_comm` | string | Immediate parent process name match (walks lineage table) |
+| `ancestor_comm` | string | Any ancestor process name match (full chain search) |
+| `uid` | int | Exact UID match; `-1` or omit to match any |
+| `path_contains` | string | Substring match on `filename`; omit to match any |
+| `mode_mask` | int | CHMOD only: fire if `(mode & mode_mask) != 0` |
+| `threshold_count` | int | Fire only after this many matches within `threshold_window_secs` |
+| `threshold_window_secs` | int | Window for threshold counting (seconds) |
+| `suppress_after_secs` | int | Suppress this rule for N seconds after first alert fires |
+| `action` | string | `"kill"` — terminate the matched process via BPF (`--response-kill` must be set) |
+| `message` | string | Alert message with `{variable}` substitution |
+
+### Message template variables
+
+`{comm}` `{pid}` `{ppid}` `{uid}` `{gid}` `{cgroup}` `{filename}` `{args}` `{new_path}` `{mode}` `{target_pid}` `{ptrace_req}` `{daddr}` `{dport}` `{laddr}` `{lport}` `{uid_before}` `{uid_after}` `{dns_name}`
+
+### Alert output
+
+**Text mode** — alerts go to stderr:
+```
+[ALERT:critical] Privilege escalation: sudo (pid=1024) escalated uid 1000→0
+[ALERT:critical] Threat intel match — kill: nc connected to blocklisted IP 198.51.100.5:4444
+```
+
+**JSON mode** — alerts appear inline in the event stream:
+```json
+{"type":"ALERT","severity":"critical","rule":"Privilege escalation","pid":1024,"ppid":1023,"uid":1000,"comm":"sudo","message":"sudo (pid=1024) escalated uid 1000→0"}
+```
+
+Rules are reloaded on `SIGHUP` — no restart needed to deploy new detections.
+
+## Active response
+
+When `--response-kill` is passed and a rule has `"action": "kill"`, argus writes the matched PID into a BPF hash map (`kill_list`). On the next kernel event from that PID (or immediately on subsequent tracepoint invocations), the BPF program calls `bpf_send_signal(SIGKILL)` — the process is terminated before its next syscall returns.
+
+This is a hard kill mechanism suitable for:
+- Terminating processes that connect to known C2 infrastructure (THREAT_INTEL + kill)
+- Stopping processes that load unauthorized kernel modules (KMOD_LOAD + kill)
+- Killing rogue processes that attempt ptrace injection (PTRACE + kill)
+
+The kill action is gated behind `--response-kill` as an explicit safety switch to prevent accidental rule deployments from terminating production processes.
+
+## Prometheus metrics
+
+`--metrics-port <n>` starts a background HTTP server that serves Prometheus text format on any path:
+
+```sh
+curl http://localhost:9090/metrics
+```
+
+```
+# HELP argus_events_total Total events observed by argus
+# TYPE argus_events_total counter
+argus_events_total 48291
+
+# HELP argus_events_by_type Events observed per type
+# TYPE argus_events_by_type counter
+argus_events_by_type{type="exec"} 1204
+argus_events_by_type{type="connect"} 892
+argus_events_by_type{type="dns"} 744
+...
+
+# HELP argus_drops_total Ring-buffer events dropped
+# TYPE argus_drops_total counter
+argus_drops_total 0
+
+# HELP argus_rule_hits_total Alert rules matched
+# TYPE argus_rule_hits_total counter
+argus_rule_hits_total 17
+
+# HELP argus_anomalies_total Baseline anomalies detected
+# TYPE argus_anomalies_total counter
+argus_anomalies_total 3
+
+# HELP argus_forward_connections_total Successful TCP forward connections
+# TYPE argus_forward_connections_total counter
+argus_forward_connections_total 2
+```
+
+Wire this into a Prometheus scrape job and add Grafana dashboards or Alertmanager rules for drop-rate alerting and rule-hit trending.
+
+## Fleet mode (`argus-server`)
+
+`argus-server` is a TCP aggregator that receives NDJSON streams from multiple argus instances, injects a `"host"` field, and re-emits to stdout (or a downstream SIEM):
+
+```sh
+# Start the aggregator (listen on all interfaces, port 9000)
+./argus-server --port 9000
+
+# Each sensor forwards to the aggregator
+sudo ./argus --forward aggregator.internal:9000 --json
+```
+
+The aggregator adds `"host": "<sender-IP>"` to each event JSON object and writes them to stdout as NDJSON, making it easy to pipe into a log shipper, Kafka topic, or Elasticsearch ingest pipeline.
+
+## Output modes
+
+| Flag | Description |
+|---|---|
+| *(default)* | Text table to stdout (USER column shows username from `/etc/passwd`) |
+| `--json` / `--output-fmt json` | Newline-delimited JSON; includes `"user"` and `"hostname"` fields |
+| `--output-fmt cef` | ArcSight CEF for direct SIEM ingestion |
+| `--output <path>` | Append event stream to file; compatible with any format |
+| `--syslog` / `--output-fmt syslog` | All events go to `syslog(LOG_DAEMON)` |
+| `--output-fmt text` | Explicit default (useful in config file) |
+
+## Forwarding
+
+`--forward host:port` streams every matched event as newline-delimited JSON over a persistent TCP connection.
+
+```sh
+# Any TCP listener works — netcat for quick testing
+nc -lk 9000
+
+# Production: Vector, Logstash, Fluent Bit, Loki, custom receiver
+sudo ./argus --forward siem.internal:9000
+
+# TLS with server certificate verification
+sudo ./argus --forward siem.internal:9000 --forward-tls
+
+# TLS without cert check (self-signed / private CA)
+sudo ./argus --forward siem.internal:9000 --forward-tls-noverify
+
+# IPv6
+sudo ./argus --forward '[::1]:9000'
+```
+
+### Multiple targets
+
+Up to 8 forwarding targets can be active simultaneously via the `"targets"` array in the config file:
+
+```json
+{
+    "forward": "primary-siem:9000",
+    "targets": [
+        {"addr": "backup-siem:9000"},
+        {"addr": "cloud-siem.corp:9001", "tls": true}
+    ]
+}
+```
+
+### Reliability behaviour
+
+| Condition | Behaviour |
+|---|---|
+| Remote unreachable at startup | Non-fatal warning; retries with exponential backoff (1 s → 2 s → … → 30 s) |
+| Connection lost mid-run | Reconnects automatically with same backoff |
+| Send buffer full (slow receiver) | Event dropped and counted; drop count sent as `{"type":"DROP","count":N}` on reconnect |
+| `SIGHUP` | Reconnects and reloads config |
+
+## Security
+
+### Privilege drop
+
+After all BPF programs are attached and the ring buffer fd is open, argus drops from root to `nobody` (uid 65534). All open file descriptors remain valid after the privilege drop.
+
+### Seccomp filter
+
+Immediately after the privilege drop, argus installs a seccomp BPF denylist. Even if the event-loop code is compromised, the filter prevents:
+
+- **New processes** — `execve`, `execveat`, `fork`, `vfork` → `EPERM`
+- **Process inspection** — `ptrace` → `EPERM`
+- **Credential escalation** — `setuid`, `setgid`, `setresuid`, `setresgid` → `EPERM`
+- **Kernel-level attacks** — `mount`, `init_module`, `finit_module`, `kexec_load` → `EPERM`
+
+`PR_SET_NO_NEW_PRIVS` is also set so child processes cannot gain new privileges. On kernels without seccomp support, the call is silently skipped.
 
 ## Config reload (SIGHUP)
 
@@ -357,186 +718,82 @@ sudo kill -HUP $(pidof argus)
 sudo systemctl reload argus
 ```
 
-On SIGHUP, argus re-reads `/etc/argus/config.json` and `~/.config/argus/config.json` and immediately updates the BPF filter maps (pid/comm allowlists, rate limit), the userspace filters (path, excludes), and reloads the alert rules file. The event type mask and ring buffer size remain fixed for the lifetime of the process — changing those requires a restart.
+On SIGHUP, argus re-reads both config files, updates BPF filter maps (pid/comm allowlists, rate limits), reloads alert rules, and reconnects forwarders. The event type mask and ring buffer size remain fixed for the lifetime of the process.
 
-## Alert rules
+## PID subtree tracking (`--follow`)
 
-Argus can evaluate a set of detection rules against every event and emit alerts for matches. Load rules with `--rules <path>` or set the `rules` key in the config file.
-
-### Rule file format
-
-A JSON array of rule objects. All match fields are optional — omit to match any value:
-
-```json
-[
-    {
-        "name":          "World-writable chmod",
-        "severity":      "high",
-        "type":          "CHMOD",
-        "mode_mask":     2,
-        "message":       "{comm} made {filename} world-writable (mode=0{mode})"
-    },
-    {
-        "name":          "Ptrace injection attempt",
-        "severity":      "critical",
-        "type":          "PTRACE",
-        "message":       "{comm} (pid={pid}) traced pid={target_pid} req={ptrace_req}"
-    },
-    {
-        "name":          "Root file deletion",
-        "severity":      "medium",
-        "type":          "UNLINK",
-        "uid":           0,
-        "message":       "root deleted {filename}"
-    },
-    {
-        "name":          "Suspicious shadow access",
-        "severity":      "high",
-        "path_contains": "/etc/shadow",
-        "message":       "{comm} (uid={uid}) accessed {filename}"
-    },
-    {
-        "name":          "Netcat execution",
-        "severity":      "low",
-        "type":          "EXEC",
-        "comm":          "nc",
-        "message":       "netcat started by pid={ppid} lineage={comm}"
-    }
-]
-```
-
-### Rule fields
-
-| Field | Type | Description |
-|---|---|---|
-| `name` | string | Rule name — required, shown in alert output |
-| `severity` | string | `info` \| `low` \| `medium` \| `high` \| `critical` |
-| `type` | string | Event type to match (`EXEC`, `OPEN`, `CHMOD`, etc.); omit to match all |
-| `comm` | string | Exact process name match; omit to match any |
-| `uid` | int | Exact UID match; `-1` or omit to match any |
-| `path_contains` | string | Substring match on `filename`; omit to match any |
-| `mode_mask` | int | CHMOD only: fire if `(mode & mode_mask) != 0` |
-| `message` | string | Alert message with `{variable}` substitution |
-
-### Message template variables
-
-`{comm}` `{pid}` `{ppid}` `{uid}` `{gid}` `{cgroup}` `{filename}` `{args}` `{new_path}` `{mode}` `{target_pid}` `{ptrace_req}` `{daddr}` `{dport}` `{laddr}` `{lport}`
-
-### Alert output
-
-**Text mode** — alerts go to stderr so the event table on stdout stays clean:
-```
-[ALERT:high] World-writable chmod: chmod made /etc/cron.d/job world-writable (mode=0777)
-[ALERT:critical] Ptrace injection attempt: gdb (pid=8801) traced pid=3821 req=16
-```
-
-**JSON mode** — alerts appear inline in the event stream:
-```json
-{"type":"ALERT","severity":"high","rule":"World-writable chmod","pid":4102,"ppid":4100,"uid":0,"comm":"chmod","message":"chmod made /etc/cron.d/job world-writable (mode=0777)"}
-```
-
-**Syslog mode** — alerts are sent at the appropriate priority (`LOG_INFO` through `LOG_CRIT`):
-```
-argus[1234]: ALERT:high rule=World-writable chmod pid=4102 comm=chmod chmod made /etc/cron.d/job world-writable
-```
-
-Rules are reloaded on `SIGHUP` — edit the rules file and send HUP to deploy new detections without restarting argus.
-
-## Output modes
-
-| Flag | Description |
-|---|---|
-| *(default)* | Text table to stdout |
-| `--json` | Newline-delimited JSON to stdout (or `--output` file) |
-| `--output <path>` | Append event stream to file; compatible with `--json` |
-| `--syslog` | All events go to `syslog(LOG_DAEMON)`; overrides `--json` and `--output` |
-
-`--output` opens the file in append mode so it survives log rotation. The systemd service uses stdout redirection by default; `--output` is most useful when running argus outside of systemd.
-
-## Forwarding
-
-`--forward host:port` streams every matched event as newline-delimited JSON over a persistent TCP connection.  The remote listener receives the same JSON objects produced by `--json`; `{"type":"DROP","count":N}` records are forwarded whenever the ring buffer drops events.
+`--follow <pid>` traces a process and all its descendants dynamically as they are spawned. The BPF `sched_process_fork` tracepoint propagates the tracked set automatically.
 
 ```sh
-# Any TCP listener works — netcat for quick testing
-nc -lk 9000
+# Trace nginx and every worker process it spawns
+sudo ./argus --follow $(pidof nginx | awk '{print $1}')
 
-# Production: Vector, Logstash, Fluent Bit, Loki, custom receiver
-sudo ./argus --forward siem.internal:9000
-
-# IPv6
-sudo ./argus --forward '[::1]:9000'
+# Trace a shell session and everything it runs
+sudo ./argus --follow $$
 ```
 
-### Reliability behaviour
+## DNS reverse-lookup
 
-| Condition | Behaviour |
-|---|---|
-| Remote unreachable at startup | Non-fatal warning; retries with exponential backoff (1 s → 2 s → … → 30 s) |
-| Connection lost mid-run | Reconnects automatically with same backoff |
-| Send buffer full (slow receiver) | Event dropped and counted; drop count sent as `{"type":"DROP","count":N}` on next reconnect |
-| `SIGHUP` | Reconnects and reloads config; forward address fixed for the lifetime of the process |
-
-### Combining output modes
-
-`--forward` is independent of `--output`, `--syslog`, and `--json` — they can all be active at once:
-
-```sh
-# Forward to SIEM, write local copy, show human-readable table on stdout
-sudo ./argus --forward siem.internal:9000 \
-             --output /var/log/argus/events.jsonl \
-             --json
-```
-
-In this configuration:
-- **stdout** — JSON stream (or text table without `--json`)
-- **`--output` file** — JSON stream appended to disk
-- **`--forward` socket** — JSON stream to remote receiver
-- **`--syslog`** — if also set, overrides stdout and `--output`; forwarding continues independently
-
-### Config file
+CONNECT and BIND events automatically include a reverse-DNS hostname lookup. Results are cached in a 512-entry table with a 300-second TTL.
 
 ```json
-{
-    "forward": "siem.internal:9000"
-}
+{"type":"CONNECT",...,"daddr":"93.184.216.34","hostname":"example.com","dport":443}
 ```
-
-### Receiver example (Python)
-
-```python
-import socket, json
-
-srv = socket.socket()
-srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind(('', 9000))
-srv.listen(1)
-print("waiting for argus...")
-conn, addr = srv.accept()
-print(f"connected: {addr}")
-buf = ""
-for chunk in iter(lambda: conn.recv(4096).decode(), ""):
-    buf += chunk
-    while '\n' in buf:
-        line, buf = buf.split('\n', 1)
-        if line:
-            event = json.loads(line)
-            print(event.get('type'), event.get('comm'), event.get('pid'))
-```
-
-## Security
-
-After all BPF programs are attached and the ring buffer file descriptor is open, argus drops from root to `nobody` (uid 65534) so the event loop runs with minimal privilege. All open file descriptors remain valid after the privilege drop.
-
-To keep root throughout (e.g. for debugging), pass `--no-drop-privs`.
 
 ## Process lineage
 
-At startup, argus scans `/proc` to pre-populate the ancestry cache with all currently running processes before any BPF programs attach. This eliminates the cold-start gap where pre-existing processes would show `?` for their lineage. The `lineage` field shows the ancestor chain from the oldest known ancestor down to the immediate parent (e.g. `systemd→sshd→bash`).
+At startup, argus scans `/proc` to pre-populate the ancestry cache with all running processes. The `lineage` field shows the ancestor chain from the oldest known ancestor down to the immediate parent (e.g. `systemd→sshd→bash`). Rule fields `parent_comm` and `ancestor_comm` query this same cache.
+
+## Testing
+
+```sh
+# Unit tests — no root, no kernel required
+make test
+
+# Unit tests with AddressSanitizer + UBSan
+make test-asan
+
+# Integration tests — requires root and a built argus binary
+make test-integration
+```
+
+Unit tests cover: filter logic, lineage cache, alert rules (including suppression/threshold), TCP forwarding, baseline/anomaly module (including rolling merge), Prometheus metrics, FIM, and DNS/threat-intel correlation — **227 tests** across 8 test binaries.
+
+## Performance tuning
+
+**Ring buffer size** — Default 256 KB. On busy servers increase with `--ringbuf 1024`.
+
+**Kernel-side vs userspace filters** — `--pid`, `--comm`, `--rate-limit`, `--rate-limit-per-pid`, and threat-intel matching are all enforced inside BPF before events reach the ring buffer. `--path` and `--exclude` are evaluated in userspace.
+
+**Summary mode** — `--summary 60` trades per-event latency for dramatically lower output volume. Recommended for long-running daemon deployments.
+
+**Metrics** — If `--metrics-port` is not set, all metric counters are no-ops with zero overhead.
+
+## Troubleshooting
+
+**`error: failed to open BPF skeleton`** — Ensure you're running as root (or have `CAP_BPF` + `CAP_PERFMON`) and that the kernel is 5.8+.
+
+**`ls: cannot access '/sys/kernel/btf/vmlinux': No such file or directory`** — Your kernel was built without BTF. Check with `zcat /proc/config.gz | grep CONFIG_DEBUG_INFO_BTF`.
+
+**BPF verifier error on load** — Usually seen on kernels older than 5.15. Reduce `ARGUS_MAX_ARGS` in `argus.bpf.c` and rebuild.
+
+**`warning: could not drop privileges`** — The `nobody` user does not exist. Add with `useradd -r -s /sbin/nologin nobody` or pass `--no-drop-privs`.
+
+**High drop rate** — Increase `--ringbuf` and/or add `--pid` / `--comm` / `--events` filters. Drop counts appear as `[WARNING: N event(s) dropped]` in text mode and `{"type":"DROP","count":N}` in JSON.
+
+**Validate your config before deploying:**
+
+```sh
+./argus --config /etc/argus/config.json --config-check
+```
+
+## CI
+
+Every push and pull request to `main` runs the full test suite on GitHub Actions across two kernel versions (`ubuntu-latest` and `ubuntu-22.04` / kernel 5.15 LTS). Each run installs all build dependencies, verifies BTF availability, builds the binary, and runs unit, ASAN, and integration tests.
 
 ## Development environment
 
-If you are on macOS or a machine without a compatible Linux kernel, use the included Lima VM config to get a full Ubuntu 22.04 environment with all dependencies pre-installed:
+If you are on macOS or a machine without a compatible Linux kernel, use the included Lima VM config:
 
 ```sh
 # Install Lima (macOS)
@@ -556,82 +813,47 @@ sudo ./argus
 
 The Lima VM uses Apple's Virtualization Framework (`vmType: vz`) on Apple Silicon for near-native performance. Your macOS home directory is mounted read-write inside the VM at the same path, so edits in VS Code are immediately visible inside the VM.
 
-To connect VS Code directly to the VM via Remote SSH, add the Lima SSH config:
+To connect VS Code directly to the VM via Remote SSH:
 
 ```sh
 limactl show-ssh --format config argus >> ~/.ssh/config
 # Then connect to host "lima-argus" in VS Code Remote SSH
 ```
 
-## Testing
-
-```sh
-# Unit tests — no root, no kernel required
-make test
-
-# Unit tests with AddressSanitizer + UBSan
-make test-asan
-
-# Integration tests — requires root and a built argus binary
-make test-integration
-```
-
-Unit tests cover `event_matches` filter logic (pid, comm, path, excludes, event mask), the lineage cache (chain building, tombstone deletion, buffer truncation), the alert rules engine (rule loading, field matching, message template expansion, JSON alert output), and TCP forwarding (address parsing, live TCP send/receive, NDJSON framing, drop reporting). Integration tests start argus against live kernel events and verify: `--pid`, `--comm`, `--events`, `--exclude`, each of the 5 new event types (UNLINK, RENAME, CHMOD, BIND, PTRACE), `--rate-limit` drop behaviour, `--forward` TCP delivery, `--rules` alert firing, and `--output` file persistence.
-
-## Performance tuning
-
-**Ring buffer size** — The default 256 KB is enough for most workloads. On busy servers (many short-lived processes or high file open rates) you may see drop warnings. Increase with `--ringbuf 1024` or via the config file. The kernel requires the size to be a power-of-2 multiple of the page size; libbpf rounds up automatically.
-
-**Kernel-side vs userspace filters** — `--pid` and `--comm` are enforced inside the BPF programs before events enter the ring buffer, so they add near-zero overhead even on noisy hosts. `--path`, `--exclude`, and `--events` are cheaper than running with no filter at all (`--events` prevents unused BPF programs from loading entirely) but still copy events to userspace first.
-
-**Summary mode** — `--summary 60` trades per-event latency for dramatically lower output volume on high-event-rate hosts. Recommended for long-running daemon deployments where detailed event streams would flood the log.
-
-## Troubleshooting
-
-**`error: failed to open BPF skeleton`** — The binary cannot load the embedded BPF object. Ensure you're running as root (or have `CAP_BPF` + `CAP_PERFMON`) and that the kernel is 5.8+.
-
-**`ls: cannot access '/sys/kernel/btf/vmlinux': No such file or directory`** — Your kernel was built without BTF. On Ubuntu, install `linux-image-$(uname -r)` from the main repository (not a custom kernel). Check with `zcat /proc/config.gz | grep CONFIG_DEBUG_INFO_BTF`.
-
-**BPF verifier error on load** — Usually seen on kernels older than 5.15 with strict verifier bounds checking. The `#pragma unroll` arg-capture loop in `argus.bpf.c` is already tuned for 5.15. If you hit this on an even older kernel, reduce `ARGUS_MAX_ARGS` in `argus.bpf.c` and rebuild.
-
-**`warning: could not drop privileges`** — The `nobody` user does not exist on this system. Argus continues as root. Add the user with `useradd -r -s /sbin/nologin nobody` or pass `--no-drop-privs` to suppress the warning.
-
-**High drop rate** — Increase `--ringbuf` and/or add `--pid` / `--comm` / `--events` filters to reduce event volume. Drop counts appear in text output as `[WARNING: N event(s) dropped]` and inline in JSON as `{"type":"DROP","count":N}`.
-
-**Validate your config before deploying:**
-
-```sh
-./argus --config /etc/argus/config.json --config-check
-```
-
-## CI
-
-Every push and pull request to `main` runs the full test suite on GitHub Actions across two kernel versions (`ubuntu-latest` and `ubuntu-22.04` / kernel 5.15 LTS). Each run installs all build dependencies, verifies BTF availability, builds the binary, and runs unit, ASAN, and integration tests.
-
 ## Repository layout
 
 ```
-argus.bpf.c          eBPF kernel programs (execve, openat, connect, unlinkat, renameat2,
-                       fchmodat, bind, ptrace, sched_process_exit, sched_process_fork)
-argus.c              Userspace loader, ring buffer consumer, CLI
-output.c/h           Text, JSON, and syslog formatting; filtering; summary mode;
-                       file output (--output) support; DNS hostname in CONNECT/BIND
-rules.c/h            Alert rule engine: JSON rule loading, event matching, alert emission
-forward.c/h          TCP event forwarding: non-blocking send, reconnect with backoff
+argus.bpf.c          eBPF kernel programs — all 21 event types; BPF maps for kill list,
+                       threat-intel LPM trie, rate limiting, per-syscall scratch buffers
+argus.c              Userspace loader, ring buffer consumer, CLI, DNS correlation cache,
+                       DGA entropy detection, LD_PRELOAD check dispatch, FIM dispatch
+output.c/h           Text, JSON, CEF, and syslog formatting for all 21 event types;
+                       filtering; summary mode; uid→username enrichment
+rules.c/h            Alert rule engine: JSON loading, field matching (incl. parent_comm,
+                       ancestor_comm), threshold/suppression, action=kill dispatch
+forward.c/h          Multi-target TCP event forwarding with optional TLS
 dns.c/h              Reverse-DNS lookup cache (512 entries, 300 s TTL)
-baseline.c/h         Baseline / anomaly detection: learn per-comm profiles, alert on deviations
-lineage.c/h          Userspace process ancestry cache
+baseline.c/h         Baseline / anomaly detection: cgroup-aware keys, rolling merge
+fim.c/h              File Integrity Monitoring: SHA-256 hashing, change detection
+ldpreload.c/h        LD_PRELOAD / LD_LIBRARY_PATH / PYTHONPATH injection detection
+threatintel.c/h      Threat-intel CIDR feed loader into BPF LPM trie
+metrics.c/h          Prometheus metrics HTTP endpoint (background pthread)
+seccomp.c/h          Seccomp BPF denylist: blocks exec/fork/ptrace/setuid after priv-drop
+lineage.c/h          Userspace process ancestry cache; parent_comm/ancestor_comm queries
 config.c/h           JSON config file parser
-argus.h              Shared event struct, type definitions, TRACE_* bitmasks
+argus.h              Shared event struct, 21 type definitions, TRACE_* bitmasks
+argus-server.c       Fleet aggregator: multi-sensor TCP receiver with host field injection
+argus.8              Man page
 argus.spec           RPM spec file (make rpm)
 argus.service        systemd service unit
 argus.tmpfiles       systemd-tmpfiles config for /var/log/argus pre-creation
 argus.logrotate      logrotate config (daily, 14 days, compressed)
-tests/               Unit tests (test_lineage.c, test_output.c, test_rules.c,
-                       test_forward.c) and integration test (test_filter.sh — 13 scenarios)
+tests/               Unit tests (test_lineage, test_output, test_rules, test_forward,
+                       test_baseline, test_metrics, test_fim, test_netcorr) and
+                       integration test (test_filter.sh)
 lima/                Lima VM config for development on non-Linux hosts
-.devcontainer/       VS Code Dev Container config (alternative to Lima)
+.devcontainer/       VS Code Dev Container config
 .github/workflows/   GitHub Actions CI (ubuntu-latest + ubuntu-22.04 matrix)
 Makefile             Build entry point (targets: all, test, test-asan, test-integration,
-                       install, deb, rpm, clean)
+                       install, deb, rpm, man, clean)
 ```

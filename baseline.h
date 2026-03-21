@@ -68,4 +68,19 @@ int  baseline_check(const event_t *e);
 /* Free all baseline resources (learning data and loaded profile). */
 void baseline_free(void);
 
+/*
+ * Enable rolling merge: after an anomalous value is seen N times it is
+ * automatically added to the profile without emitting an anomaly alert.
+ * Call before baseline_load().  n=0 disables (default).
+ */
+void baseline_set_merge_after(int n);
+
+/*
+ * Enable cgroup-aware profiling: the profile key becomes "cgroup/comm"
+ * instead of just "comm", so containers with the same process name are
+ * profiled independently.  Call before baseline_load() / baseline_learn_init().
+ * v=1 enables, v=0 disables (default).
+ */
+void baseline_set_cgroup_aware(int v);
+
 #endif /* __BASELINE_H */

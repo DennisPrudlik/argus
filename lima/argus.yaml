@@ -58,10 +58,12 @@ provision:
         libbpf-dev \
         libelf-dev \
         zlib1g-dev \
+        libssl-dev \
         linux-tools-common \
         linux-tools-generic \
         bpftrace \
         strace \
+        python3 \
         git
 
       # Symlink bpftool to a stable path

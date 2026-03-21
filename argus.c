@@ -7,6 +7,7 @@
 #include <pwd.h>
 #include <grp.h>
 #include <unistd.h>
+#include <sys/types.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "argus.skel.h"
@@ -18,14 +19,129 @@
 #include "forward.h"
 #include "baseline.h"
 #include "dns.h"
+#include "seccomp.h"
+#include "metrics.h"
+#include "fim.h"
+#include "ldpreload.h"
+#include "threatintel.h"
 
 static volatile int running       = 1;
 static volatile int reload_config = 0;
-static uint64_t     last_drops    = 0;
+static uint64_t     last_drops      = 0;
+static uint64_t     g_total_drops   = 0;   /* lifetime drop count for hint  */
 static int          g_forwarding  = 0;   /* set after forward_init succeeds */
+
+/* ── DNS correlation cache ──────────────────────────────────────────────── */
+
+#define DNS_CACHE_SIZE 512
+
+struct dns_cache_entry {
+    uint32_t pid;
+    uint8_t  ip[16];
+    int      family;
+    char     name[128];
+    uint64_t ts;         /* populated time (seconds since epoch) */
+};
+
+static struct dns_cache_entry g_dns_cache[DNS_CACHE_SIZE];
+static int                    g_dns_cache_pos = 0;   /* circular write cursor */
+
+static void dns_cache_insert(uint32_t pid, const uint8_t *ip, int family,
+                              const char *name)
+{
+    struct dns_cache_entry *ent = &g_dns_cache[g_dns_cache_pos % DNS_CACHE_SIZE];
+    ent->pid    = pid;
+    ent->family = family;
+    memcpy(ent->ip, ip, 16);
+    strncpy(ent->name, name ? name : "", sizeof(ent->name) - 1);
+    ent->name[sizeof(ent->name) - 1] = '\0';
+    ent->ts     = (uint64_t)time(NULL);
+    g_dns_cache_pos++;
+}
+
+/* Returns a cached name for the given IP, or NULL if not found.
+ * Only considers entries less than 60 seconds old. */
+static const char *dns_cache_lookup(const uint8_t *ip, int family)
+{
+    uint64_t now = (uint64_t)time(NULL);
+    for (int i = 0; i < DNS_CACHE_SIZE; i++) {
+        struct dns_cache_entry *ent = &g_dns_cache[i];
+        if (!ent->name[0])
+            continue;
+        if (ent->family != family)
+            continue;
+        if (now - ent->ts > 60)
+            continue;
+        int addrlen = (family == 2) ? 4 : 16;
+        if (memcmp(ent->ip, ip, addrlen) == 0)
+            return ent->name;
+    }
+    return NULL;
+}
+
+/* ── Shannon entropy (for DGA detection) ───────────────────────────────── */
+
+static double dns_entropy(const char *s)
+{
+    if (!s || !s[0])
+        return 0.0;
+
+    /* Count frequency of each ASCII character */
+    int freq[256] = {};
+    int len = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        freq[(int)*p]++;
+        len++;
+    }
+    if (len == 0)
+        return 0.0;
+
+    double h = 0.0;
+    for (int i = 0; i < 256; i++) {
+        if (freq[i] == 0)
+            continue;
+        double p = (double)freq[i] / (double)len;
+        /* H = -sum(p * log2(p)) = sum(p * log2(1/p)) */
+        double lp = 0.0;
+        /* Compute log2 via natural log */
+        double v = p;
+        /* ln(v) via simple series approximation for v in (0,1]:
+         * use the identity ln(v) = -ln(1/v).  For accuracy use the
+         * standard library log() which is always available in <math.h>.
+         * We avoid <math.h> by using a compile-time log2 via the relation
+         * log2(x) = log(x)/log(2).  Since we can't include math.h
+         * without -lm, implement a fast integer-quality log2 sufficient
+         * for entropy calculation.
+         */
+        /* Use __builtin_log which is available in GCC/Clang without -lm */
+        lp = __builtin_log(1.0 / v) / 0.693147180559945; /* ln(2) */
+        h += p * lp;
+    }
+    return h;
+}
+
+static void dga_check(const event_t *e, const argus_cfg_t *cfg)
+{
+    if (!cfg || cfg->dga_entropy_threshold <= 0.0)
+        return;
+    /* Use just the hostname part (before first dot) */
+    char host[128] = {};
+    strncpy(host, e->filename, sizeof(host) - 1);
+    char *dot = strchr(host, '.');
+    if (dot) *dot = '\0';
+    double h = dns_entropy(host);
+    if (h > cfg->dga_entropy_threshold)
+        fprintf(stderr,
+                "[DGA] pid=%d comm=%s query=%s entropy=%.2f (threshold=%.2f)\n",
+                e->pid, e->comm, e->filename, h, cfg->dga_entropy_threshold);
+}
 
 static void sig_handler(int sig)    { (void)sig; running = 0; }
 static void sighup_handler(int sig) { (void)sig; reload_config = 1; }
+
+/* Pointer to current config — set in main() before the event loop starts.
+ * Used by handle_event() for DGA threshold and ldpreload checks. */
+static const argus_cfg_t *g_cfg = NULL;
 
 /* ── drop accounting ────────────────────────────────────────────────────── */
 
@@ -91,9 +207,13 @@ static void usage(const char *prog)
         "  --forward         <host:port>  Stream JSON events to remote host over TCP\n"
         "  --forward-tls                  Enable TLS for --forward (verify server cert)\n"
         "  --forward-tls-noverify         Enable TLS for --forward (skip cert verify)\n"
+        "  --output-fmt      <fmt>        Output format: text (default), json, syslog, cef\n"
+        "  --pid-file        <path>       Write daemon PID to file (removed on exit)\n"
         "  --baseline        <path>       Detect anomalies using learnt profile\n"
         "  --baseline-learn  <secs>       Learn a baseline for N seconds\n"
         "  --baseline-out    <path>       Write learnt baseline profile to file\n"
+        "  --baseline-merge-after <n>    Auto-merge anomaly into profile after N sightings\n"
+        "  --metrics-port    <port>       Expose Prometheus metrics on HTTP port (default off)\n"
         "  --no-drop-privs               Stay root after attach (not recommended)\n"
         "  --json                         Newline-delimited JSON output\n"
         "  --config-check                 Validate config file(s) and print settings, then exit\n"
@@ -128,7 +248,9 @@ static int parse_event_list(const char *s)
 /* ── BPF setup ──────────────────────────────────────────────────────────── */
 
 static void setup_bpf_filters(struct argus_bpf *skel, const filter_t *f,
-                               uint32_t rate_limit_per_comm, int follow_pid)
+                               uint32_t rate_limit_per_comm,
+                               uint32_t rate_limit_per_pid,
+                               int follow_pid)
 {
     argus_config_t cfg = {};
     uint32_t zero = 0;
@@ -156,6 +278,7 @@ static void setup_bpf_filters(struct argus_bpf *skel, const filter_t *f,
         cfg.filter_follow_active = 1;
     }
     cfg.rate_limit_per_comm = rate_limit_per_comm;
+    cfg.rate_limit_per_pid  = rate_limit_per_pid;
     bpf_map_update_elem(bpf_map__fd(skel->maps.config_map),
                         &zero, &cfg, BPF_ANY);
 }
@@ -202,6 +325,12 @@ static void configure_programs(struct argus_bpf *skel, int event_mask,
         bpf_program__set_autoload(skel->progs.handle_ptrace_enter, false);
         bpf_program__set_autoload(skel->progs.handle_ptrace_exit,  false);
     }
+    if (!(event_mask & (TRACE_DNS | TRACE_SEND))) {
+        bpf_program__set_autoload(skel->progs.handle_sendto_enter, false);
+        bpf_program__set_autoload(skel->progs.handle_sendto_exit,  false);
+    }
+    if (!(event_mask & TRACE_WRITE_CLOSE))
+        bpf_program__set_autoload(skel->progs.handle_close_enter, false);
 }
 
 /* ── event handler ──────────────────────────────────────────────────────── */
@@ -211,24 +340,105 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
     (void)ctx; (void)data_sz;
     const event_t *e = data;
 
-    if (event_matches(e)) {
-        print_event(e);
-        if (g_forwarding)
-            forward_event(e);
+    /* Symbol resolution: if filename looks like memfd or is empty, read /proc */
+    event_t resolved_event;
+    const event_t *ev = e;
+    if (e->type == EVENT_EXEC &&
+        (e->filename[0] == '\0' || strncmp(e->filename, "memfd:", 6) == 0 ||
+         strstr(e->filename, "(deleted)") != NULL)) {
+        resolved_event = *e;
+        char exe_path[64];
+        char link_target[128] = {};
+        snprintf(exe_path, sizeof(exe_path), "/proc/%d/exe", e->pid);
+        ssize_t n = readlink(exe_path, link_target, sizeof(link_target) - 1);
+        if (n > 0) {
+            link_target[n] = '\0';
+            strncpy(resolved_event.filename, link_target,
+                    sizeof(resolved_event.filename) - 1);
+            ev = &resolved_event;
+        }
     }
 
+    /* ── DNS correlation cache update ────────────────────────────────── */
+    if (ev->type == EVENT_DNS) {
+        dns_cache_insert((uint32_t)ev->pid, ev->daddr, ev->family,
+                         ev->filename);
+        if (g_cfg)
+            dga_check(ev, g_cfg);
+    }
+
+    /* ── DNS→connect correlation (synthetic NET_CORR event) ────────── */
+    if (ev->type == EVENT_CONNECT) {
+        const char *dname = dns_cache_lookup(ev->daddr, ev->family);
+        if (dname && dname[0]) {
+            event_t corr = *ev;
+            corr.type = EVENT_NET_CORR;
+            strncpy(corr.dns_name, dname, sizeof(corr.dns_name) - 1);
+            corr.dns_name[sizeof(corr.dns_name) - 1] = '\0';
+            /* Emit the correlation event through normal paths */
+            if (event_matches(&corr)) {
+                print_event(&corr);
+                if (g_forwarding)
+                    forward_event(&corr);
+            }
+            rules_check(&corr);
+        }
+    }
+
+    /* ── LD_PRELOAD env check on exec ────────────────────────────────── */
+    if (ev->type == EVENT_EXEC)
+        ldpreload_check(ev);
+
+    /* ── FIM check on file close-after-write ──────────────────────────── */
+    if (ev->type == EVENT_WRITE_CLOSE)
+        fim_check(ev);
+
+    /* ── KMOD_LOAD: resolve fd→filename via /proc ─────────────────────── */
+    if (ev->type == EVENT_KMOD_LOAD && ev->target_pid > 0) {
+        event_t *mut_ev = (event_t *)ev;  /* safe: resolved_event or e copy */
+        if (ev == e) {
+            /* make a mutable copy */
+            resolved_event = *e;
+            mut_ev = &resolved_event;
+            ev = mut_ev;
+        }
+        char fdpath[64];
+        snprintf(fdpath, sizeof(fdpath), "/proc/%d/fd/%d",
+                 ev->pid, ev->target_pid);
+        char link_target[256] = {};
+        ssize_t n = readlink(fdpath, link_target, sizeof(link_target) - 1);
+        if (n > 0) {
+            link_target[n] = '\0';
+            strncpy(mut_ev->filename, link_target,
+                    sizeof(mut_ev->filename) - 1);
+            /* Warn if module loaded from outside /lib/modules */
+            if (strncmp(link_target, "/lib/modules", 12) != 0)
+                fprintf(stderr,
+                        "[KMOD] pid=%d comm=%s loaded module from unusual path: %s\n",
+                        ev->pid, ev->comm, link_target);
+        }
+    }
+
+    if (event_matches(ev)) {
+        print_event(ev);
+        if (g_forwarding)
+            forward_event(ev);
+    }
+
+    metrics_event(ev);
+
     /* Run alert rules and baseline check regardless of output filter */
-    rules_check(e);
+    rules_check(ev);
     if (baseline_learning())
-        baseline_learn(e);
+        baseline_learn(ev);
     else
-        baseline_check(e);
+        baseline_check(ev);
 
     /* Update lineage regardless of filter so the tree stays consistent */
-    if (e->type == EVENT_EXEC)
-        lineage_update(e->pid, e->ppid, e->comm);
-    else if (e->type == EVENT_EXIT)
-        lineage_remove(e->pid);
+    if (ev->type == EVENT_EXEC)
+        lineage_update(ev->pid, ev->ppid, ev->comm);
+    else if (ev->type == EVENT_EXIT)
+        lineage_remove(ev->pid);
 
     return 0;
 }
@@ -275,10 +485,14 @@ int main(int argc, char **argv)
         {"forward",             required_argument, 0, 'f'},
         {"forward-tls",         no_argument,       0, 't'},
         {"forward-tls-noverify",no_argument,       0, 'T'},
-        {"baseline",        required_argument, 0, 'b'},
-        {"baseline-learn",  required_argument, 0, 'L'},
-        {"baseline-out",    required_argument, 0, 'B'},
-        {"no-drop-privs",   no_argument,       0, 'n'},
+        {"output-fmt",      required_argument, 0, 'O'},
+        {"pid-file",        required_argument, 0, 'D'},
+        {"baseline",              required_argument, 0, 'b'},
+        {"baseline-learn",        required_argument, 0, 'L'},
+        {"baseline-out",          required_argument, 0, 'B'},
+        {"baseline-merge-after",  required_argument, 0, 'M'},
+        {"metrics-port",          required_argument, 0, 'm'},
+        {"no-drop-privs",         no_argument,       0, 'n'},
         {"json",            no_argument,       0, 'j'},
         {"config-check",    no_argument,       0, 'K'},
         {"version",         no_argument,       0, 'V'},
@@ -287,8 +501,9 @@ int main(int argc, char **argv)
     };
 
     int config_check = 0;
+    int fmt_set      = 0;   /* 1 = --json / --syslog / --output-fmt given explicitly */
     int opt;
-    while ((opt = getopt_long(argc, argv, "C:p:F:c:P:x:e:r:s:R:o:Sa:f:tTb:L:B:njKVh",
+    while ((opt = getopt_long(argc, argv, "C:p:F:c:P:x:e:r:s:R:o:Sa:f:tTO:D:b:L:B:M:m:njKVh",
                               long_opts, NULL)) != -1) {
         switch (opt) {
         case 'C':
@@ -325,11 +540,25 @@ int main(int argc, char **argv)
         case 'f': strncpy(cfg.forward_addr,  optarg, sizeof(cfg.forward_addr)-1);       break;
         case 't': cfg.forward_tls          = 1;                                          break;
         case 'T': cfg.forward_tls_noverify = 1;                                          break;
+        case 'O':
+            if      (strcmp(optarg, "json")   == 0) { fmt = OUTPUT_JSON;   fmt_set = 1; }
+            else if (strcmp(optarg, "syslog") == 0) { cfg.use_syslog = 1; fmt_set = 1; }
+            else if (strcmp(optarg, "cef")    == 0) { fmt = OUTPUT_CEF;   fmt_set = 1; }
+            else if (strcmp(optarg, "text")   == 0) { fmt = OUTPUT_TEXT;  fmt_set = 1; }
+            else {
+                fprintf(stderr, "error: unknown --output-fmt '%s' "
+                                "(valid: text, json, syslog, cef)\n", optarg);
+                return 1;
+            }
+            break;
+        case 'D': strncpy(cfg.pid_file, optarg, sizeof(cfg.pid_file)-1);                break;
         case 'b': strncpy(cfg.baseline_path, optarg, sizeof(cfg.baseline_path)-1);      break;
         case 'L': cfg.baseline_learn_secs   = atoi(optarg);                             break;
-        case 'B': strncpy(cfg.baseline_out,  optarg, sizeof(cfg.baseline_out)-1);       break;
+        case 'B': strncpy(cfg.baseline_out,  optarg, sizeof(cfg.baseline_out)-1);        break;
+        case 'M': cfg.baseline_merge_after  = atoi(optarg);                              break;
+        case 'm': cfg.metrics_port          = atoi(optarg);                              break;
         case 'n': no_drop_privs             = 1;                                         break;
-        case 'j': fmt                       = OUTPUT_JSON;                               break;
+        case 'j': fmt = OUTPUT_JSON; fmt_set = 1;                                        break;
         case 'K': config_check              = 1;                                         break;
         case 'V': printf("argus %s\n", ARGUS_VERSION); return 0;
         case 'h': usage(argv[0]); return 0;
@@ -337,7 +566,14 @@ int main(int argc, char **argv)
         }
     }
 
-    /* --syslog overrides --json and --output */
+    /* Apply output_fmt from config file when no explicit CLI flag was given */
+    if (!fmt_set && cfg.output_fmt != OUTPUT_TEXT) {
+        fmt = cfg.output_fmt;
+        if (fmt == OUTPUT_SYSLOG)
+            cfg.use_syslog = 1;
+    }
+
+    /* --syslog overrides --json / --cef / --output */
     if (cfg.use_syslog)
         fmt = OUTPUT_SYSLOG;
 
@@ -353,12 +589,26 @@ int main(int argc, char **argv)
         printf("  output_path         : %s\n",  cfg.output_path[0]  ? cfg.output_path  : "(stdout)");
         printf("  syslog              : %s\n",  cfg.use_syslog      ? "yes"            : "no");
         printf("  rules               : %s\n",  cfg.rules_path[0]   ? cfg.rules_path   : "(none)");
+        printf("  output_fmt          : %s\n",
+               fmt == OUTPUT_JSON   ? "json"   :
+               fmt == OUTPUT_SYSLOG ? "syslog" :
+               fmt == OUTPUT_CEF    ? "cef"    : "text");
+        printf("  pid_file            : %s\n",  cfg.pid_file[0] ? cfg.pid_file : "(none)");
         printf("  forward             : %s\n",  cfg.forward_addr[0] ? cfg.forward_addr : "(off)");
         if (cfg.forward_addr[0]) {
             const char *tls_mode = cfg.forward_tls_noverify ? "tls-noverify"
                                  : cfg.forward_tls          ? "tls"
                                  : "plain";
             printf("  forward_tls         : %s\n", tls_mode);
+        }
+        if (cfg.forward_target_count > 0) {
+            printf("  targets             : %d additional target(s)\n",
+                   cfg.forward_target_count);
+            for (int i = 0; i < cfg.forward_target_count; i++) {
+                const char *tm = cfg.forward_targets[i].tls_noverify ? "tls-noverify"
+                               : cfg.forward_targets[i].tls          ? "tls" : "plain";
+                printf("    [%d] %s (%s)\n", i, cfg.forward_targets[i].addr, tm);
+            }
         }
         printf("  follow_pid          : %d\n",  cfg.follow_pid);
         printf("  baseline            : %s\n",  cfg.baseline_path[0]     ? cfg.baseline_path     : "(off)");
@@ -396,6 +646,13 @@ int main(int argc, char **argv)
         }
     }
 
+    /* Write PID file before privilege drop */
+    if (cfg.pid_file[0]) {
+        FILE *pf = fopen(cfg.pid_file, "w");
+        if (pf) { fprintf(pf, "%d\n", (int)getpid()); fclose(pf); }
+        else      perror("warning: could not write pid-file");
+    }
+
     output_init(fmt, &cfg.filter);
     if (output_file)
         output_set_file(output_file);
@@ -425,6 +682,27 @@ int main(int argc, char **argv)
         }
     }
 
+    /* Additional targets from "targets" array in config file */
+    for (int i = 0; i < cfg.forward_target_count; i++) {
+        char fwd_host[256] = {};
+        int  fwd_port = 0;
+        if (forward_parse_addr(cfg.forward_targets[i].addr, fwd_host,
+                               sizeof(fwd_host), &fwd_port) != 0) {
+            fprintf(stderr, "warning: targets[%d]: invalid address '%s'\n",
+                    i, cfg.forward_targets[i].addr);
+            continue;
+        }
+        int fwd_flags = 0;
+        if (cfg.forward_targets[i].tls_noverify)
+            fwd_flags = FORWARD_FLAG_TLS_NOVERIFY;
+        else if (cfg.forward_targets[i].tls)
+            fwd_flags = FORWARD_FLAG_TLS;
+        if (forward_add(fwd_host, fwd_port, fwd_flags) == 0) {
+            forwarding   = 1;
+            g_forwarding = 1;
+        }
+    }
+
     /* Load alert rules */
     if (cfg.rules_path[0]) {
         int n = rules_load(cfg.rules_path);
@@ -434,6 +712,9 @@ int main(int argc, char **argv)
     }
 
     /* Initialise baseline (learning or detection mode) */
+    if (cfg.baseline_merge_after > 0)
+        baseline_set_merge_after(cfg.baseline_merge_after);
+
     if (cfg.baseline_learn_secs > 0) {
         const char *out = cfg.baseline_out[0] ? cfg.baseline_out : "baseline.json";
         if (baseline_learn_init(out, cfg.baseline_learn_secs) == 0)
@@ -448,6 +729,16 @@ int main(int argc, char **argv)
         else
             fprintf(stderr, "warning: could not load baseline profile %s\n",
                     cfg.baseline_path);
+    }
+
+    /* Start Prometheus metrics endpoint (before privilege drop — needs bind) */
+    if (cfg.metrics_port > 0) {
+        if (metrics_init(cfg.metrics_port) == 0)
+            fprintf(stderr, "info: metrics endpoint on http://0.0.0.0:%d/metrics\n",
+                    cfg.metrics_port);
+        else
+            fprintf(stderr, "warning: could not start metrics endpoint on port %d\n",
+                    cfg.metrics_port);
     }
 
     /* Ignore SIGPIPE so piped consumers (jq, etc.) can exit without crashing us */
@@ -482,13 +773,42 @@ int main(int argc, char **argv)
     }
 
     setup_bpf_filters(skel, &cfg.filter, cfg.rate_limit_per_comm,
-                      cfg.follow_pid);
+                      cfg.rate_limit_per_pid, cfg.follow_pid);
 
     err = argus_bpf__attach(skel);
     if (err) {
         fprintf(stderr, "error: failed to attach BPF programs: %d\n", err);
         goto cleanup;
     }
+
+    /* Pass kill_list map fd to rules engine for active-response support */
+    rules_set_kill_fd(bpf_map__fd(skel->maps.kill_list));
+
+    /* Load threat intelligence CIDR blocklist into BPF LPM trie maps */
+    if (cfg.threat_intel_path[0]) {
+        int ti_fd_v4 = bpf_map__fd(skel->maps.threat_intel_v4);
+        int ti_fd_v6 = bpf_map__fd(skel->maps.threat_intel_v6);
+        int n = threatintel_load(cfg.threat_intel_path, ti_fd_v4, ti_fd_v6);
+        if (n >= 0)
+            fprintf(stderr, "info: loaded %d threat intel CIDR(s) from %s\n",
+                    n, cfg.threat_intel_path);
+        else
+            fprintf(stderr, "warning: could not load threat intel from %s\n",
+                    cfg.threat_intel_path);
+    }
+
+    /* Initialise file integrity monitoring */
+    if (cfg.fim_path_count > 0)
+        fim_init(
+            (const char (*)[256])cfg.fim_paths,
+            cfg.fim_path_count);
+
+    /* Configure cgroup-aware baseline */
+    if (cfg.baseline_cgroup_aware)
+        baseline_set_cgroup_aware(1);
+
+    /* Expose config to handle_event() for DGA/ldpreload checks */
+    g_cfg = &cfg;
 
     rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event, NULL, NULL);
     if (!rb) {
@@ -500,6 +820,9 @@ int main(int argc, char **argv)
     /* Drop root privileges — all BPF fds are already open */
     if (!no_drop_privs)
         drop_privileges();
+
+    /* Install seccomp denylist (prevents exec/fork/ptrace/setuid from event loop) */
+    seccomp_apply();
 
     print_header("eBPF");
 
@@ -532,7 +855,7 @@ int main(int argc, char **argv)
                 cfg_load(cfg_home_path, &new_cfg);
             /* Preserve follow_pid — it's a startup-time CLI option */
             setup_bpf_filters(skel, &new_cfg.filter, new_cfg.rate_limit_per_comm,
-                              cfg.follow_pid);
+                              new_cfg.rate_limit_per_pid, cfg.follow_pid);
             output_update_filter(&new_cfg.filter);
             cfg.filter              = new_cfg.filter;
             cfg.rate_limit_per_comm = new_cfg.rate_limit_per_comm;
@@ -548,8 +871,22 @@ int main(int argc, char **argv)
 
         uint64_t delta = read_drop_delta(drop_fd);
         output_summary_tick(delta);
-        if (delta && !cfg.summary_interval)
-            print_drops(delta);
+        if (delta) {
+            if (!cfg.summary_interval)
+                print_drops(delta);
+            g_total_drops += delta;
+            metrics_drop(delta);
+            /* Ring-buffer sizing hint: suggest doubling if >1000 cumulative drops */
+            if (g_total_drops >= 1000 && cfg.ring_buffer_kb < 65536) {
+                int suggested = cfg.ring_buffer_kb * 2;
+                if (suggested > 65536) suggested = 65536;
+                fprintf(stderr,
+                        "hint: %llu ring-buffer drops so far — "
+                        "consider --ringbuf %d\n",
+                        (unsigned long long)g_total_drops, suggested);
+                g_total_drops = 0;   /* reset so hint fires at next 1000 drops */
+            }
+        }
         if (forwarding) {
             if (delta) forward_drops(delta);
             forward_tick();
@@ -572,9 +909,14 @@ cleanup:
     rules_free();
     baseline_free();
     dns_free();
+    metrics_fini();
+    fim_free();
+    threatintel_free();
     if (forwarding)
         forward_fini();
     if (output_file)
         fclose(output_file);
+    if (cfg.pid_file[0])
+        unlink(cfg.pid_file);
     return err < 0 ? -err : err;
 }

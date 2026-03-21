@@ -42,6 +42,19 @@ struct {
     __type(value, argus_config_t);
 } config_map SEC(".maps");
 
+/*
+ * kernel_rules — in-kernel drop rules written by userspace.
+ * Events matching an active rule are discarded before the ring buffer.
+ * Uses a fixed ARRAY of KERNEL_RULES_MAX entries; inactive slots have
+ * active==0 and are skipped.
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, KERNEL_RULES_MAX);
+    __type(key, uint32_t);
+    __type(value, kernel_rule_t);
+} kernel_rules SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 256);
@@ -83,7 +96,89 @@ struct {
     __type(value, struct rate_slot);
 } rate_limit_map SEC(".maps");
 
+/* ── Per-PID rate limiting ──────────────────────────────────────────────── */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, uint32_t);
+    __type(value, struct rate_slot);
+} pid_rate_map SEC(".maps");
+
+/* ── Active response kill list ──────────────────────────────────────────── */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, uint32_t);
+    __type(value, uint8_t);
+} kill_list SEC(".maps");
+
+/* ── Threat intel LPM trie (IPv4) ───────────────────────────────────────── */
+struct lpm_v4_key {
+    uint32_t prefixlen;
+    uint8_t  data[4];
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 65536);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, struct lpm_v4_key);
+    __type(value, uint8_t);
+} threat_intel_v4 SEC(".maps");
+
+/* ── Threat intel LPM trie (IPv6) ───────────────────────────────────────── */
+struct lpm_v6_key {
+    uint32_t prefixlen;
+    uint8_t  data[16];
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 16384);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, struct lpm_v6_key);
+    __type(value, uint8_t);
+} threat_intel_v6 SEC(".maps");
+
+/* ── Scratch maps for new handlers ──────────────────────────────────────── */
+struct privesc_start { uint64_t ts; uint32_t uid_before; uint32_t pad; };
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, uint32_t);
+    __type(value, struct privesc_start);
+} privesc_scratch SEC(".maps");
+
+struct mmap_start { uint64_t id; int prot; int flags; int fd; uint32_t pad; };
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 8192);
+    __type(key, uint64_t);
+    __type(value, struct mmap_start);
+} mmap_active SEC(".maps");
+
+struct kmod_start { uint64_t ts; int fd; uint32_t pad; };
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, uint32_t);
+    __type(value, struct kmod_start);
+} kmod_scratch SEC(".maps");
+
+struct ns_start { uint64_t ts; uint32_t flags; uint32_t fd; };
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, uint32_t);
+    __type(value, struct ns_start);
+} ns_scratch SEC(".maps");
+
 /* ── Filter helpers ─────────────────────────────────────────────────────── */
+
+static __always_inline int check_kill_list(uint32_t pid)
+{
+    uint8_t *v = bpf_map_lookup_elem(&kill_list, &pid);
+    if (v) { bpf_send_signal(9); return 1; }
+    return 0;
+}
 
 static __always_inline int should_drop_pid(uint32_t pid)
 {
@@ -102,6 +197,10 @@ static __always_inline int should_drop_pid(uint32_t pid)
  */
 static __always_inline int should_filter_out(uint32_t pid, char comm[16])
 {
+    /* Kill-list check: send SIGKILL and drop if pid is listed */
+    if (check_kill_list(pid))
+        return 1;
+
     uint32_t zero = 0;
     argus_config_t *cfg = bpf_map_lookup_elem(&config_map, &zero);
     if (!cfg)
@@ -130,6 +229,65 @@ static __always_inline int should_filter_out(uint32_t pid, char comm[16])
         }
     }
 
+    /* Per-PID rate limiting */
+    argus_config_t *cfg_pid = bpf_map_lookup_elem(&config_map, &zero);
+    if (cfg_pid && cfg_pid->rate_limit_per_pid > 0) {
+        struct rate_slot *ps = bpf_map_lookup_elem(&pid_rate_map, &pid);
+        uint64_t now_ns_pid = bpf_ktime_get_ns();
+        if (ps) {
+            if (now_ns_pid - ps->window_ns < 1000000000ULL) {
+                if (ps->count >= cfg_pid->rate_limit_per_pid) {
+                    note_drop();
+                    return 1;
+                }
+                ps->count++;
+            } else {
+                ps->window_ns = now_ns_pid;
+                ps->count = 1;
+            }
+        } else {
+            struct rate_slot new_slot = { .window_ns = now_ns_pid, .count = 1 };
+            bpf_map_update_elem(&pid_rate_map, &pid, &new_slot, BPF_ANY);
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * kernel_rule_drop — check whether a (pid, comm, event_type, uid) tuple
+ * matches any active kernel_rules entry.  Returns 1 to drop, 0 to pass.
+ * Called from each BPF exit handler BEFORE reserving ring-buffer space.
+ */
+static __always_inline int kernel_rule_drop(uint32_t pid __attribute__((unused)),
+                                            char comm[16], int etype,
+                                            uint32_t uid)
+{
+    /* Bounded loop — verifier sees exactly KERNEL_RULES_MAX iterations */
+    #pragma unroll
+    for (uint32_t i = 0; i < KERNEL_RULES_MAX; i++) {
+        kernel_rule_t *r = bpf_map_lookup_elem(&kernel_rules, &i);
+        if (!r || !r->active)
+            continue;
+        /* event_type: -1 = wildcard */
+        if (r->event_type != -1 && r->event_type != etype)
+            continue;
+        /* uid: 0xFFFFFFFF = wildcard */
+        if (r->uid != 0xFFFFFFFFU && r->uid != uid)
+            continue;
+        /* comm: all-zero = wildcard */
+        if (r->comm[0] != '\0') {
+            int match = 1;
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                if (r->comm[j] != comm[j]) { match = 0; break; }
+                if (r->comm[j] == '\0') break;
+            }
+            if (!match)
+                continue;
+        }
+        return 1;   /* drop this event */
+    }
     return 0;
 }
 
@@ -336,6 +494,8 @@ cleanup:
 
 struct open_start {
     uint64_t ts;
+    uint32_t flags;          /* openat flags (args[2]) */
+    uint32_t pad;
     char     filename[128];
 };
 
@@ -346,11 +506,28 @@ struct {
     __type(value, struct open_start);
 } opens SEC(".maps");
 
+/*
+ * fd_track — maps (pid<<32|fd) → filename for write-mode opens.
+ * Populated by handle_openat_exit when flags indicate write intent.
+ * Consumed by handle_close_enter to emit EVENT_WRITE_CLOSE.
+ */
+struct fd_entry {
+    char filename[128];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, uint64_t);        /* (uint64_t)pid << 32 | (uint32_t)fd */
+    __type(value, struct fd_entry);
+} fd_track SEC(".maps");
+
 SEC("tracepoint/syscalls/sys_enter_openat")
 int handle_openat_enter(struct trace_event_raw_sys_enter *ctx)
 {
     struct open_start os = {};
-    os.ts = bpf_ktime_get_ns();
+    os.ts    = bpf_ktime_get_ns();
+    os.flags = (uint32_t)ctx->args[2];   /* openat flags */
     bpf_probe_read_user_str(os.filename, sizeof(os.filename),
                             (const char *)ctx->args[1]);
 
@@ -376,6 +553,12 @@ int handle_openat_exit(struct trace_event_raw_sys_exit *ctx)
     if (should_filter_out(pid, comm))
         goto cleanup;
 
+    uint64_t uid_gid = bpf_get_current_uid_gid();
+    uint32_t uid = (uint32_t)uid_gid;
+
+    if (kernel_rule_drop(pid, comm, EVENT_OPEN, uid))
+        goto cleanup;
+
     event_t *e = bpf_ringbuf_reserve(&rb, sizeof(event_t), 0);
     if (!e) {
         note_drop();
@@ -385,11 +568,23 @@ int handle_openat_exit(struct trace_event_raw_sys_exit *ctx)
     e->type        = EVENT_OPEN;
     e->duration_ns = bpf_ktime_get_ns() - os->ts;
     e->success     = (ctx->ret >= 0);
+    e->open_flags  = os->flags;
     fill_common(e, pid, comm);
 
     __builtin_memcpy(e->filename, os->filename, sizeof(e->filename));
 
     bpf_ringbuf_submit(e, 0);
+
+    /*
+     * Track write-mode opens so we can emit EVENT_WRITE_CLOSE on close().
+     * O_WRONLY=1, O_RDWR=2; either means the file will be written.
+     */
+    if (ctx->ret >= 0 && (os->flags & 3) != 0) {
+        struct fd_entry fe = {};
+        __builtin_memcpy(fe.filename, os->filename, sizeof(fe.filename));
+        uint64_t key = ((uint64_t)pid << 32) | (uint32_t)ctx->ret;
+        bpf_map_update_elem(&fd_track, &key, &fe, BPF_ANY);
+    }
 
 cleanup:
     bpf_map_delete_elem(&opens, &id);
@@ -519,6 +714,16 @@ int handle_connect_exit(struct trace_event_raw_sys_exit *ctx)
     e->dport       = cs->dport;
     __builtin_memcpy(e->daddr, cs->daddr, sizeof(e->daddr));
     fill_common(e, pid, comm);
+
+    /* Threat intel check for IPv4 */
+    if (e->family == 2) {
+        struct lpm_v4_key tk = {};
+        tk.prefixlen = 32;
+        __builtin_memcpy(tk.data, e->daddr, 4);
+        if (bpf_map_lookup_elem(&threat_intel_v4, &tk)) {
+            e->type = EVENT_THREAT_INTEL;
+        }
+    }
 
     bpf_ringbuf_submit(e, 0);
 
@@ -915,6 +1120,235 @@ cleanup:
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
+ * EVENT_WRITE_CLOSE — tracepoint/syscalls/sys_enter_close
+ * Emitted when a write-mode fd (tracked by handle_openat_exit) is closed.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+SEC("tracepoint/syscalls/sys_enter_close")
+int handle_close_enter(struct trace_event_raw_sys_enter *ctx)
+{
+    uint32_t fd = (uint32_t)ctx->args[0];
+    uint64_t id = bpf_get_current_pid_tgid();
+    uint32_t pid = (uint32_t)(id >> 32);
+
+    uint64_t key = ((uint64_t)pid << 32) | fd;
+    struct fd_entry *fe = bpf_map_lookup_elem(&fd_track, &key);
+    if (!fe)
+        return 0;
+
+    char comm[16] = {};
+    bpf_get_current_comm(comm, sizeof(comm));
+    if (should_filter_out(pid, comm))
+        goto cleanup;
+
+    uint64_t uid_gid = bpf_get_current_uid_gid();
+    if (kernel_rule_drop(pid, comm, EVENT_WRITE_CLOSE, (uint32_t)uid_gid))
+        goto cleanup;
+
+    event_t *e = bpf_ringbuf_reserve(&rb, sizeof(event_t), 0);
+    if (!e) {
+        note_drop();
+        goto cleanup;
+    }
+
+    e->type    = EVENT_WRITE_CLOSE;
+    e->success = true;
+    fill_common(e, pid, comm);
+    __builtin_memcpy(e->filename, fe->filename, sizeof(e->filename));
+
+    bpf_ringbuf_submit(e, 0);
+
+cleanup:
+    bpf_map_delete_elem(&fd_track, &key);
+    return 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * EVENT_DNS / EVENT_SEND — tracepoint/syscalls/sys_{enter,exit}_sendto
+ *
+ * EVENT_DNS  — sendto to UDP port 53; filename holds parsed DNS query name.
+ * EVENT_SEND — any sendto; filename holds first 128 bytes of payload;
+ *              mode field holds actual captured length.
+ *
+ * Both reuse daddr/dport for the destination address.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+struct sendto_start {
+    uint64_t ts;
+    uint8_t  family;
+    uint16_t dport;
+    uint8_t  daddr[16];
+    uint32_t payload_len;
+    uint32_t pad;
+    char     payload[128];   /* raw bytes for EVENT_SEND */
+    char     dns_name[128];  /* decoded name for EVENT_DNS (port 53) */
+    int      is_dns;         /* 1 if dest port == 53 */
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, uint32_t);
+    __type(value, struct sendto_start);
+} sendto_scratch SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, uint64_t);
+    __type(value, struct sendto_start);
+} sendtos SEC(".maps");
+
+/*
+ * Parse a DNS wire-format query name starting at `src` into dot-separated
+ * ASCII.  Returns 0 on success, -1 if the name is malformed or overflows.
+ * `out` must be at least `outsz` bytes.  Reads at most 64 bytes from src.
+ */
+static __always_inline int parse_dns_name(const uint8_t *src, char *out,
+                                          uint32_t outsz)
+{
+    uint32_t si = 0, oi = 0;
+    uint8_t label_len;
+
+    /* DNS name starts at `src`; max 64 bytes to parse (verifier limit) */
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        if (si >= 64 || oi >= outsz - 1)
+            break;
+        if (bpf_probe_read_user(&label_len, 1, src + si))
+            return -1;
+        si++;
+        if (label_len == 0)   /* root label = end of name */
+            break;
+        if (label_len > 63)   /* compression pointer or malformed */
+            return -1;
+        if (oi > 0 && oi < outsz - 1)
+            out[oi++] = '.';
+        #pragma unroll
+        for (int j = 0; j < 63; j++) {
+            if (j >= (int)label_len) break;
+            if (si >= 128 || oi >= outsz - 1) break;
+            uint8_t ch;
+            if (bpf_probe_read_user(&ch, 1, src + si))
+                return -1;
+            out[oi++] = (char)ch;
+            si++;
+        }
+    }
+    out[oi < outsz ? oi : outsz - 1] = '\0';
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_sendto")
+int handle_sendto_enter(struct trace_event_raw_sys_enter *ctx)
+{
+    /* sendto args: fd, buf, len, flags, dest_addr, addrlen */
+    uint64_t id  = bpf_get_current_pid_tgid();
+    uint32_t pid = (uint32_t)(id >> 32);
+    if (should_drop_pid(pid))
+        return 0;
+
+    void *dest_addr = (void *)ctx->args[4];
+    if (!dest_addr)
+        return 0;   /* no destination — skip (UNIX domain or connected socket) */
+
+    uint16_t family = 0;
+    if (bpf_probe_read_user(&family, sizeof(family), dest_addr))
+        return 0;
+    if (family != AF_INET && family != AF_INET6)
+        return 0;
+
+    uint32_t zero = 0;
+    struct sendto_start *ss = bpf_map_lookup_elem(&sendto_scratch, &zero);
+    if (!ss)
+        return 0;
+    __builtin_memset(ss, 0, sizeof(*ss));
+
+    ss->ts     = bpf_ktime_get_ns();
+    ss->family = (uint8_t)family;
+
+    struct sockaddr_in  sin  = {};
+    struct sockaddr_in6 sin6 = {};
+    if (family == AF_INET) {
+        bpf_probe_read_user(&sin, sizeof(sin), dest_addr);
+        ss->dport = bpf_ntohs(sin.sin_port);
+        __builtin_memcpy(ss->daddr, &sin.sin_addr.s_addr, 4);
+    } else {
+        bpf_probe_read_user(&sin6, sizeof(sin6), dest_addr);
+        ss->dport = bpf_ntohs(sin6.sin6_port);
+        __builtin_memcpy(ss->daddr, &sin6.sin6_addr.in6_u.u6_addr8, 16);
+    }
+
+    /* Capture payload (up to 128 bytes) */
+    const void *buf = (const void *)ctx->args[1];
+    uint32_t    len = (uint32_t)ctx->args[2];
+    if (len > 128) len = 128;
+    ss->payload_len = len;
+    if (buf && len > 0)
+        bpf_probe_read_user(ss->payload, len & 127, buf);
+
+    /* Decode DNS query name if destination port is 53 and there are ≥13 bytes */
+    if (ss->dport == 53 && ss->payload_len >= 13) {
+        /* DNS query: 12-byte header, then the QNAME at offset 12 */
+        const uint8_t *qname_ptr = (const uint8_t *)buf + 12;
+        if (parse_dns_name(qname_ptr, ss->dns_name, sizeof(ss->dns_name)) == 0)
+            ss->is_dns = 1;
+    }
+
+    bpf_map_update_elem(&sendtos, &id, ss, BPF_ANY);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_sendto")
+int handle_sendto_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    uint64_t id = bpf_get_current_pid_tgid();
+
+    struct sendto_start *ss = bpf_map_lookup_elem(&sendtos, &id);
+    if (!ss)
+        goto cleanup;
+
+    uint32_t pid = (uint32_t)(id >> 32);
+    char comm[16] = {};
+    bpf_get_current_comm(comm, sizeof(comm));
+    if (should_filter_out(pid, comm))
+        goto cleanup;
+
+    uint64_t uid_gid = bpf_get_current_uid_gid();
+    uint32_t uid     = (uint32_t)uid_gid;
+
+    event_type_t etype = ss->is_dns ? EVENT_DNS : EVENT_SEND;
+    if (kernel_rule_drop(pid, comm, etype, uid))
+        goto cleanup;
+
+    event_t *e = bpf_ringbuf_reserve(&rb, sizeof(event_t), 0);
+    if (!e) {
+        note_drop();
+        goto cleanup;
+    }
+
+    e->type        = etype;
+    e->duration_ns = bpf_ktime_get_ns() - ss->ts;
+    e->success     = (ctx->ret >= 0);
+    e->family      = ss->family;
+    e->dport       = ss->dport;
+    e->mode        = ss->payload_len;   /* payload_len stored in mode field */
+    __builtin_memcpy(e->daddr, ss->daddr, sizeof(e->daddr));
+    fill_common(e, pid, comm);
+
+    if (ss->is_dns)
+        __builtin_memcpy(e->filename, ss->dns_name,  sizeof(e->filename));
+    else
+        __builtin_memcpy(e->filename, ss->payload,   sizeof(e->filename));
+
+    bpf_ringbuf_submit(e, 0);
+
+cleanup:
+    bpf_map_delete_elem(&sendtos, &id);
+    return 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
  * Sched fork — tracepoint/sched/sched_process_fork
  * Propagates the follow_pids set to child processes when --follow is active.
  * Only runs when filter_follow_active == 1; disabled at load time otherwise.
@@ -935,6 +1369,340 @@ int handle_process_fork(struct trace_event_raw_sched_process_fork *ctx)
         uint8_t val = 1;
         bpf_map_update_elem(&follow_pids, &child_pid, &val, BPF_ANY);
     }
+    return 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * EVENT_PRIVESC — setuid / setresuid privilege escalation detection
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+SEC("tracepoint/syscalls/sys_enter_setuid")
+int handle_setuid_enter(struct trace_event_raw_sys_enter *ctx)
+{
+    uint32_t zero = 0;
+    struct privesc_start *ps = bpf_map_lookup_elem(&privesc_scratch, &zero);
+    if (!ps) return 0;
+    ps->ts = bpf_ktime_get_ns();
+    ps->uid_before = (uint32_t)(bpf_get_current_uid_gid() & 0xffffffff);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_setuid")
+int handle_setuid_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    if (ctx->ret != 0) return 0;
+    uint32_t zero = 0;
+    struct privesc_start *ps = bpf_map_lookup_elem(&privesc_scratch, &zero);
+    if (!ps || !ps->ts) return 0;
+
+    uint64_t id = bpf_get_current_pid_tgid();
+    uint32_t pid = id >> 32;
+    char comm[16] = {};
+    bpf_get_current_comm(comm, sizeof(comm));
+    if (should_filter_out(pid, comm)) return 0;
+
+    event_t *e = bpf_ringbuf_reserve(&rb, sizeof(event_t), 0);
+    if (!e) { note_drop(); return 0; }
+    __builtin_memset(e, 0, sizeof(*e));
+    fill_common(e, pid, comm);
+    e->type       = EVENT_PRIVESC;
+    e->uid_before = ps->uid_before;
+    e->uid_after  = (uint32_t)(bpf_get_current_uid_gid() & 0xffffffff);
+    e->success    = 1;
+    ps->ts = 0;
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_setresuid")
+int handle_setresuid_enter(struct trace_event_raw_sys_enter *ctx)
+{
+    uint32_t zero = 0;
+    struct privesc_start *ps = bpf_map_lookup_elem(&privesc_scratch, &zero);
+    if (!ps) return 0;
+    ps->ts = bpf_ktime_get_ns();
+    ps->uid_before = (uint32_t)(bpf_get_current_uid_gid() & 0xffffffff);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_setresuid")
+int handle_setresuid_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    if (ctx->ret != 0) return 0;
+    uint32_t zero = 0;
+    struct privesc_start *ps = bpf_map_lookup_elem(&privesc_scratch, &zero);
+    if (!ps || !ps->ts) return 0;
+
+    uint64_t id = bpf_get_current_pid_tgid();
+    uint32_t pid = id >> 32;
+    char comm[16] = {};
+    bpf_get_current_comm(comm, sizeof(comm));
+    if (should_filter_out(pid, comm)) return 0;
+
+    event_t *e = bpf_ringbuf_reserve(&rb, sizeof(event_t), 0);
+    if (!e) { note_drop(); return 0; }
+    __builtin_memset(e, 0, sizeof(*e));
+    fill_common(e, pid, comm);
+    e->type       = EVENT_PRIVESC;
+    e->uid_before = ps->uid_before;
+    e->uid_after  = (uint32_t)(bpf_get_current_uid_gid() & 0xffffffff);
+    e->success    = 1;
+    ps->ts = 0;
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * EVENT_MEMEXEC — mmap/mprotect with PROT_EXEC on anonymous mappings
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+#define PROT_EXEC_FLAG  0x4
+#define MAP_ANONYMOUS   0x20
+
+SEC("tracepoint/syscalls/sys_enter_mmap")
+int handle_mmap_enter(struct trace_event_raw_sys_enter *ctx)
+{
+    int prot  = (int)ctx->args[2];
+    int flags = (int)ctx->args[3];
+    if (!(prot & PROT_EXEC_FLAG)) return 0;
+    if (!(flags & MAP_ANONYMOUS))  return 0;
+
+    uint64_t id  = bpf_get_current_pid_tgid();
+    struct mmap_start ms = { .id = id, .prot = prot, .flags = flags,
+                             .fd = (int)ctx->args[4], .pad = 0 };
+    bpf_map_update_elem(&mmap_active, &id, &ms, BPF_ANY);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_mmap")
+int handle_mmap_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    uint64_t id = bpf_get_current_pid_tgid();
+    struct mmap_start *ms = bpf_map_lookup_elem(&mmap_active, &id);
+    if (!ms) return 0;
+    bpf_map_delete_elem(&mmap_active, &id);
+    if ((long)ctx->ret < 0) return 0;
+
+    uint32_t pid = id >> 32;
+    char comm[16] = {};
+    bpf_get_current_comm(comm, sizeof(comm));
+    if (should_filter_out(pid, comm)) return 0;
+
+    event_t *e = bpf_ringbuf_reserve(&rb, sizeof(event_t), 0);
+    if (!e) { note_drop(); return 0; }
+    __builtin_memset(e, 0, sizeof(*e));
+    fill_common(e, pid, comm);
+    e->type       = EVENT_MEMEXEC;
+    e->mode       = (uint32_t)ms->prot;
+    e->open_flags = (uint32_t)ms->flags;
+    e->success    = 1;
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_mprotect")
+int handle_mprotect_enter(struct trace_event_raw_sys_enter *ctx)
+{
+    int prot = (int)ctx->args[2];
+    if (!(prot & PROT_EXEC_FLAG)) return 0;
+
+    uint64_t id  = bpf_get_current_pid_tgid();
+    struct mmap_start ms = { .id = id, .prot = prot, .flags = 0,
+                             .fd = -1, .pad = 0 };
+    bpf_map_update_elem(&mmap_active, &id, &ms, BPF_ANY);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_mprotect")
+int handle_mprotect_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    uint64_t id = bpf_get_current_pid_tgid();
+    struct mmap_start *ms = bpf_map_lookup_elem(&mmap_active, &id);
+    if (!ms) return 0;
+    bpf_map_delete_elem(&mmap_active, &id);
+    if (ctx->ret != 0) return 0;
+
+    uint32_t pid = id >> 32;
+    char comm[16] = {};
+    bpf_get_current_comm(comm, sizeof(comm));
+    if (should_filter_out(pid, comm)) return 0;
+
+    event_t *e = bpf_ringbuf_reserve(&rb, sizeof(event_t), 0);
+    if (!e) { note_drop(); return 0; }
+    __builtin_memset(e, 0, sizeof(*e));
+    fill_common(e, pid, comm);
+    e->type       = EVENT_MEMEXEC;
+    e->mode       = (uint32_t)ms->prot;
+    e->open_flags = 1;   /* flag: this is mprotect, not mmap */
+    e->success    = 1;
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * EVENT_KMOD_LOAD — kernel module load via finit_module / init_module
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+SEC("tracepoint/syscalls/sys_enter_finit_module")
+int handle_finit_module_enter(struct trace_event_raw_sys_enter *ctx)
+{
+    uint32_t zero = 0;
+    struct kmod_start *ks = bpf_map_lookup_elem(&kmod_scratch, &zero);
+    if (!ks) return 0;
+    ks->ts = bpf_ktime_get_ns();
+    ks->fd = (int)ctx->args[0];
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_finit_module")
+int handle_finit_module_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    uint32_t zero = 0;
+    struct kmod_start *ks = bpf_map_lookup_elem(&kmod_scratch, &zero);
+    if (!ks || !ks->ts) return 0;
+
+    uint64_t id  = bpf_get_current_pid_tgid();
+    uint32_t pid = id >> 32;
+    char comm[16] = {};
+    bpf_get_current_comm(comm, sizeof(comm));
+    if (should_filter_out(pid, comm)) return 0;
+
+    event_t *e = bpf_ringbuf_reserve(&rb, sizeof(event_t), 0);
+    if (!e) { note_drop(); return 0; }
+    __builtin_memset(e, 0, sizeof(*e));
+    fill_common(e, pid, comm);
+    e->type       = EVENT_KMOD_LOAD;
+    e->target_pid = ks->fd;   /* repurpose target_pid to carry fd for userspace */
+    e->success    = (ctx->ret == 0);
+    ks->ts = 0;
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_init_module")
+int handle_init_module_enter(struct trace_event_raw_sys_enter *ctx)
+{
+    (void)ctx;
+    uint32_t zero = 0;
+    struct kmod_start *ks = bpf_map_lookup_elem(&kmod_scratch, &zero);
+    if (!ks) return 0;
+    ks->ts = bpf_ktime_get_ns();
+    ks->fd = -1;   /* in-memory load, no fd */
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_init_module")
+int handle_init_module_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    uint32_t zero = 0;
+    struct kmod_start *ks = bpf_map_lookup_elem(&kmod_scratch, &zero);
+    if (!ks || !ks->ts) return 0;
+
+    uint64_t id  = bpf_get_current_pid_tgid();
+    uint32_t pid = id >> 32;
+    char comm[16] = {};
+    bpf_get_current_comm(comm, sizeof(comm));
+    if (should_filter_out(pid, comm)) return 0;
+
+    event_t *e = bpf_ringbuf_reserve(&rb, sizeof(event_t), 0);
+    if (!e) { note_drop(); return 0; }
+    __builtin_memset(e, 0, sizeof(*e));
+    fill_common(e, pid, comm);
+    e->type    = EVENT_KMOD_LOAD;
+    e->success = (ctx->ret == 0);
+    ks->ts = 0;
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * EVENT_NS_ESCAPE — namespace escape via unshare(2) or setns(2)
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+#define CLONE_NEWNS   0x00020000
+#define CLONE_NEWPID  0x20000000
+#define CLONE_NEWNET  0x40000000
+#define CLONE_NEWUSER 0x10000000
+#define NS_FLAGS_MASK (CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWUSER)
+
+SEC("tracepoint/syscalls/sys_enter_unshare")
+int handle_unshare_enter(struct trace_event_raw_sys_enter *ctx)
+{
+    uint32_t flags = (uint32_t)ctx->args[0];
+    if (!(flags & NS_FLAGS_MASK)) return 0;
+
+    uint32_t zero = 0;
+    struct ns_start *ns = bpf_map_lookup_elem(&ns_scratch, &zero);
+    if (!ns) return 0;
+    ns->ts    = bpf_ktime_get_ns();
+    ns->flags = flags;
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_unshare")
+int handle_unshare_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    uint32_t zero = 0;
+    struct ns_start *ns = bpf_map_lookup_elem(&ns_scratch, &zero);
+    if (!ns || !ns->ts) return 0;
+    ns->ts = 0;
+    if (ctx->ret != 0) return 0;
+
+    uint64_t id  = bpf_get_current_pid_tgid();
+    uint32_t pid = id >> 32;
+    char comm[16] = {};
+    bpf_get_current_comm(comm, sizeof(comm));
+    if (should_filter_out(pid, comm)) return 0;
+
+    event_t *e = bpf_ringbuf_reserve(&rb, sizeof(event_t), 0);
+    if (!e) { note_drop(); return 0; }
+    __builtin_memset(e, 0, sizeof(*e));
+    fill_common(e, pid, comm);
+    e->type    = EVENT_NS_ESCAPE;
+    e->mode    = ns->flags & NS_FLAGS_MASK;
+    e->success = 1;
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_setns")
+int handle_setns_enter(struct trace_event_raw_sys_enter *ctx)
+{
+    uint32_t nstype = (uint32_t)ctx->args[1];
+    if (nstype && !(nstype & NS_FLAGS_MASK)) return 0;
+
+    uint32_t zero = 0;
+    struct ns_start *ns = bpf_map_lookup_elem(&ns_scratch, &zero);
+    if (!ns) return 0;
+    ns->ts    = bpf_ktime_get_ns();
+    ns->flags = nstype ? nstype : NS_FLAGS_MASK;   /* 0 means any ns */
+    ns->fd    = (uint32_t)ctx->args[0];
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_setns")
+int handle_setns_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    uint32_t zero = 0;
+    struct ns_start *ns = bpf_map_lookup_elem(&ns_scratch, &zero);
+    if (!ns || !ns->ts) return 0;
+    ns->ts = 0;
+    if (ctx->ret != 0) return 0;
+
+    uint64_t id  = bpf_get_current_pid_tgid();
+    uint32_t pid = id >> 32;
+    char comm[16] = {};
+    bpf_get_current_comm(comm, sizeof(comm));
+    if (should_filter_out(pid, comm)) return 0;
+
+    event_t *e = bpf_ringbuf_reserve(&rb, sizeof(event_t), 0);
+    if (!e) { note_drop(); return 0; }
+    __builtin_memset(e, 0, sizeof(*e));
+    fill_common(e, pid, comm);
+    e->type    = EVENT_NS_ESCAPE;
+    e->mode    = ns->flags;
+    e->success = 1;
+    bpf_ringbuf_submit(e, 0);
     return 0;
 }
 

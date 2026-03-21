@@ -7,10 +7,14 @@
 #include "baseline.h"
 #include "output.h"
 #include "argus.h"
+#include "metrics.h"
 
 #define BL_MAX_COMMS    64
 #define BL_MAX_ENTRIES  256   /* max strings per set per comm */
 #define BL_MAX_STR      128
+
+/* Max anomalous values tracked per set for rolling merge */
+#define BL_MAX_SIGHTINGS 128
 
 /* ── string set ──────────────────────────────────────────────────────────── */
 
@@ -38,13 +42,41 @@ static void set_add(str_set_t *ss, const char *val)
     ss->count++;
 }
 
+/* ── sighting tracker for rolling merge ────────────────────────────────── */
+
+typedef struct {
+    char s[BL_MAX_SIGHTINGS][BL_MAX_STR];
+    int  count[BL_MAX_SIGHTINGS];
+    int  n;
+} sight_set_t;
+
+static int sight_increment(sight_set_t *ss, const char *val)
+{
+    for (int i = 0; i < ss->n; i++) {
+        if (strncmp(ss->s[i], val, BL_MAX_STR - 1) == 0)
+            return ++ss->count[i];
+    }
+    if (ss->n >= BL_MAX_SIGHTINGS)
+        return 1;
+    strncpy(ss->s[ss->n], val, BL_MAX_STR - 1);
+    ss->s[ss->n][BL_MAX_STR - 1] = '\0';
+    ss->count[ss->n] = 1;
+    ss->n++;
+    return 1;
+}
+
 /* ── per-comm profile ────────────────────────────────────────────────────── */
 
 typedef struct {
-    char      comm[16];
-    str_set_t exec_targets;   /* filenames seen in EXEC events   */
-    str_set_t connect_dests;  /* "addr:port" seen in CONNECT     */
-    str_set_t open_paths;     /* filenames seen in OPEN events   */
+    char       comm[80];        /* widened to support "cgroup/comm" key        */
+    str_set_t  exec_targets;    /* filenames seen in EXEC events               */
+    str_set_t  connect_dests;   /* "addr:port" seen in CONNECT                 */
+    str_set_t  open_paths;      /* filenames seen in OPEN events               */
+    str_set_t  bind_ports;      /* "port" seen in BIND events                  */
+    sight_set_t sight_exec;     /* sighting counts for anomalous exec targets  */
+    sight_set_t sight_connect;  /* sighting counts for anomalous connections   */
+    sight_set_t sight_open;     /* sighting counts for anomalous open paths    */
+    sight_set_t sight_bind;     /* sighting counts for anomalous bind ports    */
 } comm_profile_t;
 
 /* ── module state ────────────────────────────────────────────────────────── */
@@ -56,30 +88,48 @@ static int    g_learning  = 0;       /* 1 while in active learning window   */
 static time_t g_learn_end = 0;       /* epoch when learning window closes   */
 static char   g_out_path[256] = {};  /* file to write the learnt profile to */
 
-static int    g_detecting = 0;       /* 1 when a profile has been loaded    */
+static int    g_detecting    = 0;    /* 1 when a profile has been loaded    */
+static int    g_merge_after  = 0;    /* 0=off; N=merge after N sightings    */
+static int    g_cgroup_aware = 0;    /* 1 = key by cgroup+comm, 0 = comm   */
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
 
-static comm_profile_t *find_or_create(const char *comm)
+/* Build the profile lookup key from an event or from a raw comm string. */
+static void build_key(char *key, size_t sz, const event_t *e)
+{
+    if (g_cgroup_aware && e->cgroup[0])
+        snprintf(key, sz, "%.63s/%.15s", e->cgroup, e->comm);
+    else
+        snprintf(key, sz, "%.15s", e->comm);
+}
+
+static comm_profile_t *find_or_create(const char *key)
 {
     for (int i = 0; i < g_profile_count; i++)
-        if (strncmp(g_profiles[i].comm, comm, 15) == 0)
+        if (strncmp(g_profiles[i].comm, key, sizeof(g_profiles[i].comm) - 1) == 0)
             return &g_profiles[i];
     if (g_profile_count >= BL_MAX_COMMS)
         return NULL;
     comm_profile_t *cp = &g_profiles[g_profile_count++];
     memset(cp, 0, sizeof(*cp));
-    strncpy(cp->comm, comm, 15);
-    cp->comm[15] = '\0';
+    strncpy(cp->comm, key, sizeof(cp->comm) - 1);
+    cp->comm[sizeof(cp->comm) - 1] = '\0';
     return cp;
 }
 
-static comm_profile_t *find_profile(const char *comm)
+static comm_profile_t *find_profile(const char *key)
 {
     for (int i = 0; i < g_profile_count; i++)
-        if (strncmp(g_profiles[i].comm, comm, 15) == 0)
+        if (strncmp(g_profiles[i].comm, key, sizeof(g_profiles[i].comm) - 1) == 0)
             return &g_profiles[i];
     return NULL;
+}
+
+void baseline_set_cgroup_aware(int v) { g_cgroup_aware = (v != 0); }
+
+void baseline_set_merge_after(int n)
+{
+    g_merge_after = (n > 0) ? n : 0;
 }
 
 /* ── alert emission ──────────────────────────────────────────────────────── */
@@ -130,7 +180,9 @@ void baseline_learn(const event_t *e)
         return;
     }
 
-    comm_profile_t *cp = find_or_create(e->comm);
+    char bkey[80] = {};
+    build_key(bkey, sizeof(bkey), e);
+    comm_profile_t *cp = find_or_create(bkey);
     if (!cp)
         return;
 
@@ -143,11 +195,17 @@ void baseline_learn(const event_t *e)
             set_add(&cp->open_paths, e->filename);
         break;
     case EVENT_CONNECT: {
-        char key[64] = {};
+        char ckey[64] = {};
         char ip[INET6_ADDRSTRLEN] = {};
         inet_ntop(e->family == 2 ? AF_INET : AF_INET6, e->daddr, ip, sizeof(ip));
-        snprintf(key, sizeof(key), "%s:%u", ip, e->dport);
-        set_add(&cp->connect_dests, key);
+        snprintf(ckey, sizeof(ckey), "%s:%u", ip, e->dport);
+        set_add(&cp->connect_dests, ckey);
+        break;
+    }
+    case EVENT_BIND: {
+        char pkey[16] = {};
+        snprintf(pkey, sizeof(pkey), "%u", e->dport);
+        set_add(&cp->bind_ports, pkey);
         break;
     }
     default:
@@ -206,6 +264,7 @@ void baseline_flush(void)
         fputs("\"exec_targets\":",  f); write_str_set(f, &cp->exec_targets);
         fputs(",\"connect_dests\":", f); write_str_set(f, &cp->connect_dests);
         fputs(",\"open_paths\":",   f); write_str_set(f, &cp->open_paths);
+        fputs(",\"bind_ports\":",   f); write_str_set(f, &cp->bind_ports);
         fputc('}', f);
     }
     fputs("}}\n", f);
@@ -320,6 +379,8 @@ int baseline_load(const char *path)
                         p = bl_parse_str_array(p, &cp->connect_dests);
                     else if (strcmp(field, "open_paths") == 0)
                         p = bl_parse_str_array(p, &cp->open_paths);
+                    else if (strcmp(field, "bind_ports") == 0)
+                        p = bl_parse_str_array(p, &cp->bind_ports);
                 }
                 p = bl_skip_ws(p);
                 if (*p == ',') p++;
@@ -335,43 +396,67 @@ int baseline_load(const char *path)
     return g_profile_count;
 }
 
+/*
+ * check_and_maybe_merge — helper for baseline_check().
+ * If value is not in the known set:
+ *   - Increment its sighting count.
+ *   - If merge_after is configured and count reaches the threshold,
+ *     silently merge it into the profile and return 0 (not anomalous).
+ *   - Otherwise emit an anomaly alert and return 1.
+ */
+static int check_and_maybe_merge(const event_t *e, str_set_t *known,
+                                 sight_set_t *sights,
+                                 const char *what, const char *value)
+{
+    if (!known->count || set_contains(known, value))
+        return 0;
+
+    int n = sight_increment(sights, value);
+    if (g_merge_after > 0 && n >= g_merge_after) {
+        /* Threshold reached — merge silently */
+        set_add(known, value);
+        return 0;
+    }
+    emit_anomaly(e, what, value);
+    metrics_anomaly();
+    return 1;
+}
+
 int baseline_check(const event_t *e)
 {
     if (!g_detecting)
         return 0;
 
-    comm_profile_t *cp = find_profile(e->comm);
+    char bkey[80] = {};
+    build_key(bkey, sizeof(bkey), e);
+    comm_profile_t *cp = find_profile(bkey);
     if (!cp)
         return 0;   /* comm not in profile — no opinion */
 
     switch (e->type) {
     case EVENT_EXEC:
-        if (cp->exec_targets.count > 0 &&
-            !set_contains(&cp->exec_targets, e->filename)) {
-            emit_anomaly(e, "new_exec_target", e->filename);
-            return 1;
-        }
-        break;
+        return check_and_maybe_merge(e, &cp->exec_targets, &cp->sight_exec,
+                                     "new_exec_target", e->filename);
     case EVENT_OPEN:
-        if (e->success && cp->open_paths.count > 0 &&
-            !set_contains(&cp->open_paths, e->filename)) {
-            emit_anomaly(e, "new_open_path", e->filename);
-            return 1;
-        }
-        break;
+        if (!e->success) return 0;
+        return check_and_maybe_merge(e, &cp->open_paths, &cp->sight_open,
+                                     "new_open_path", e->filename);
     case EVENT_CONNECT: {
-        if (cp->connect_dests.count > 0) {
-            char key[64] = {};
-            char ip[INET6_ADDRSTRLEN] = {};
-            inet_ntop(e->family == 2 ? AF_INET : AF_INET6,
-                      e->daddr, ip, sizeof(ip));
-            snprintf(key, sizeof(key), "%s:%u", ip, e->dport);
-            if (!set_contains(&cp->connect_dests, key)) {
-                emit_anomaly(e, "new_connect_dest", key);
-                return 1;
-            }
-        }
-        break;
+        if (!cp->connect_dests.count) return 0;
+        char ckey[64] = {};
+        char ip[INET6_ADDRSTRLEN] = {};
+        inet_ntop(e->family == 2 ? AF_INET : AF_INET6,
+                  e->daddr, ip, sizeof(ip));
+        snprintf(ckey, sizeof(ckey), "%s:%u", ip, e->dport);
+        return check_and_maybe_merge(e, &cp->connect_dests, &cp->sight_connect,
+                                     "new_connect_dest", ckey);
+    }
+    case EVENT_BIND: {
+        if (!cp->bind_ports.count) return 0;
+        char pkey[16] = {};
+        snprintf(pkey, sizeof(pkey), "%u", e->dport);
+        return check_and_maybe_merge(e, &cp->bind_ports, &cp->sight_bind,
+                                     "new_bind_port", pkey);
     }
     default:
         break;

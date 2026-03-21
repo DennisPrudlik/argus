@@ -503,6 +503,56 @@ check "--output: EXEC events written to output file" \
     "$([ "$FILE_EXECS" -gt 0 ] && echo 0 || echo 1)"
 rm -f "$OUT_FILE"
 
+# ── test 14: --follow PID subtree tracking ────────────────────────────────────
+
+echo ""
+echo "Test 14: --follow PID subtree tracking"
+
+# Start a long-running parent process whose children we want to track
+bash -c "sleep 30" &
+PARENT_PID=$!
+
+start_argus --follow "$PARENT_PID" --events EXEC
+
+# Spawn a child from the tracked parent
+bash -c "kill -0 $PARENT_PID 2>/dev/null && bash -c 'ls /tmp >/dev/null 2>&1'" &
+sleep 0.6
+
+# Now spawn an unrelated process (should NOT appear)
+bash -c "cat /etc/hostname >/dev/null 2>&1" &
+UNRELATED_PID=$!
+wait "$UNRELATED_PID" 2>/dev/null || true
+
+sleep 0.5
+stop_argus
+kill "$PARENT_PID" 2>/dev/null || true
+wait "$PARENT_PID" 2>/dev/null || true
+
+# The parent PID itself (and any child it spawned) should appear in output
+GOT_FOLLOW=$(python3 - "$OUTFILE" "$PARENT_PID" <<'PY'
+import sys, json
+outfile = sys.argv[1]
+parent_pid = int(sys.argv[2])
+count = 0
+with open(outfile) as f:
+    for line in f:
+        line = line.strip()
+        if not line or '"DROP"' in line:
+            continue
+        try:
+            e = json.loads(line)
+            # Accept events from the parent or any of its children (ppid == parent)
+            if e.get("pid") == parent_pid or e.get("ppid") == parent_pid:
+                count += 1
+        except Exception:
+            pass
+print(count)
+PY
+)
+check "--follow: events captured for tracked PID/subtree" \
+    "$([ "${GOT_FOLLOW:-0}" -gt 0 ] && echo 0 || echo 1)"
+rm -f "$OUTFILE"
+
 # ── results ───────────────────────────────────────────────────────────────────
 
 echo ""

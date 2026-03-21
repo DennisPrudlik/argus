@@ -166,3 +166,38 @@ char *lineage_str(uint32_t ppid, char *buf, size_t len)
     buf[off] = '\0';
     return buf;
 }
+
+/* ── lineage_parent_comm ────────────────────────────────────────────────── */
+
+void lineage_parent_comm(uint32_t ppid, char *out, size_t outsz)
+{
+    if (!out || outsz == 0)
+        return;
+    out[0] = '\0';
+    if (ppid == 0)
+        return;
+    slot_t *s = lookup(ppid);
+    if (!s)
+        return;
+    strncpy(out, s->comm, outsz - 1);
+    out[outsz - 1] = '\0';
+}
+
+/* ── lineage_has_ancestor ───────────────────────────────────────────────── */
+
+int lineage_has_ancestor(uint32_t ppid, const char *target_comm)
+{
+    if (!target_comm || !target_comm[0])
+        return 0;
+
+    uint32_t cur = ppid;
+    for (int i = 0; i < MAX_DEPTH && cur > 1; i++) {
+        slot_t *s = lookup(cur);
+        if (!s)
+            break;
+        if (strncmp(s->comm, target_comm, 15) == 0)
+            return 1;
+        cur = s->ppid;
+    }
+    return 0;
+}

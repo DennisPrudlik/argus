@@ -35,4 +35,10 @@ void lineage_remove(uint32_t pid);
  */
 char *lineage_str(uint32_t ppid, char *buf, size_t len);
 
+/* Returns the comm of the immediate parent of ppid, or empty string if not found */
+void lineage_parent_comm(uint32_t ppid, char *out, size_t outsz);
+
+/* Returns 1 if any ancestor in the ppid chain has comm matching target_comm */
+int lineage_has_ancestor(uint32_t ppid, const char *target_comm);
+
 #endif /* __LINEAGE_H */

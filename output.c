@@ -124,8 +124,9 @@ int event_matches(const event_t *e)
         return 0;
 
     /* exclude paths — applied to all file events */
-    if ((e->type == EVENT_OPEN   || e->type == EVENT_UNLINK ||
-         e->type == EVENT_RENAME || e->type == EVENT_CHMOD) &&
+    if ((e->type == EVENT_OPEN        || e->type == EVENT_UNLINK  ||
+         e->type == EVENT_RENAME      || e->type == EVENT_CHMOD   ||
+         e->type == EVENT_WRITE_CLOSE) &&
         g_filter.exclude_count > 0) {
         for (int i = 0; i < g_filter.exclude_count; i++) {
             if (g_filter.excludes[i][0] &&
@@ -191,11 +192,17 @@ static void text_event(const event_t *e)
     lineage_str(e->ppid, chain, sizeof(chain));
 
     static const char *type_names[] = {
-        [EVENT_EXEC]    = "EXEC",  [EVENT_OPEN]    = "OPEN",
-        [EVENT_EXIT]    = "EXIT",  [EVENT_CONNECT] = "CONN",
-        [EVENT_UNLINK]  = "UNLNK",[EVENT_RENAME]  = "RENM",
-        [EVENT_CHMOD]   = "CMOD", [EVENT_BIND]    = "BIND",
-        [EVENT_PTRACE]  = "PTRC",
+        [EVENT_EXEC]        = "EXEC",  [EVENT_OPEN]        = "OPEN",
+        [EVENT_EXIT]        = "EXIT",  [EVENT_CONNECT]     = "CONN",
+        [EVENT_UNLINK]      = "UNLNK",[EVENT_RENAME]      = "RENM",
+        [EVENT_CHMOD]       = "CMOD", [EVENT_BIND]        = "BIND",
+        [EVENT_PTRACE]      = "PTRC", [EVENT_DNS]         = "DNS",
+        [EVENT_SEND]        = "SEND", [EVENT_WRITE_CLOSE] = "WRCL",
+        [EVENT_PRIVESC]     = "PRIV", [EVENT_MEMEXEC]     = "MXEC",
+        [EVENT_KMOD_LOAD]   = "KMOD", [EVENT_NET_CORR]    = "CORR",
+        [EVENT_RATE_LIMIT]  = "RATE", [EVENT_THREAT_INTEL]= "THRT",
+        [EVENT_TLS_SNI]     = "SNI",  [EVENT_PROC_SCRAPE] = "SCRP",
+        [EVENT_NS_ESCAPE]   = "NSES",
     };
     const char *tname = (e->type < EVENT_TYPE_MAX) ? type_names[e->type] : "?";
 
@@ -214,7 +221,8 @@ static void text_event(const event_t *e)
         fprintf(OUT, "%s %s", e->filename, e->args);
         break;
     case EVENT_OPEN:
-        fprintf(OUT, "[%s] %s", e->success ? "OK" : "FAIL", e->filename);
+        fprintf(OUT, "[%s] flags=0x%x %s",
+                e->success ? "OK" : "FAIL", e->open_flags, e->filename);
         break;
     case EVENT_EXIT:
         fprintf(OUT, "exit_code=%d", e->exit_code);
@@ -262,6 +270,62 @@ static void text_event(const event_t *e)
         fprintf(OUT, "[%s] req=%d target_pid=%d",
                e->success ? "OK" : "FAIL", e->ptrace_req, e->target_pid);
         break;
+    case EVENT_DNS: {
+        int  af = (e->family == 2) ? AF_INET : AF_INET6;
+        char ip[INET6_ADDRSTRLEN] = {};
+        inet_ntop(af, e->daddr, ip, sizeof(ip));
+        fprintf(OUT, "[%s] query=%s dst=%s:%u",
+                e->success ? "OK" : "FAIL", e->filename, ip, e->dport);
+        break;
+    }
+    case EVENT_SEND: {
+        int  af = (e->family == 2) ? AF_INET : AF_INET6;
+        char ip[INET6_ADDRSTRLEN] = {};
+        inet_ntop(af, e->daddr, ip, sizeof(ip));
+        fprintf(OUT, "[%s] dst=%s:%u len=%u",
+                e->success ? "OK" : "FAIL", ip, e->dport, e->mode);
+        break;
+    }
+    case EVENT_WRITE_CLOSE:
+        fprintf(OUT, "%s", e->filename);
+        break;
+    case EVENT_PRIVESC:
+        fprintf(OUT, "uid %u→%u caps=0x%llx",
+                e->uid_before, e->uid_after, (unsigned long long)e->cap_data);
+        break;
+    case EVENT_MEMEXEC:
+        fprintf(OUT, "prot=0x%x flags=0x%x", e->mode, e->open_flags);
+        break;
+    case EVENT_KMOD_LOAD:
+        fprintf(OUT, "%s", e->filename[0] ? e->filename : "<anonymous>");
+        break;
+    case EVENT_NET_CORR: {
+        int  af = (e->family == 2) ? AF_INET : AF_INET6;
+        char ip[INET6_ADDRSTRLEN] = {};
+        inet_ntop(af, e->daddr, ip, sizeof(ip));
+        fprintf(OUT, "dns=%s -> %s:%u", e->dns_name, ip, e->dport);
+        break;
+    }
+    case EVENT_RATE_LIMIT:
+        fprintf(OUT, "pid=%d rate-limited", e->pid);
+        break;
+    case EVENT_THREAT_INTEL: {
+        int  af = (e->family == 2) ? AF_INET : AF_INET6;
+        char ip[INET6_ADDRSTRLEN] = {};
+        inet_ntop(af, e->daddr, ip, sizeof(ip));
+        fprintf(OUT, "[BLOCKED] %s:%u", ip, e->dport);
+        break;
+    }
+    case EVENT_TLS_SNI:
+        fprintf(OUT, "sni=%s", e->dns_name);
+        break;
+    case EVENT_PROC_SCRAPE:
+        fprintf(OUT, "target_pid=%d path=%s",
+                e->target_pid, e->filename);
+        break;
+    case EVENT_NS_ESCAPE:
+        fprintf(OUT, "flags=0x%x", e->mode);
+        break;
     }
     fputc('\n', OUT);
 }
@@ -292,15 +356,27 @@ static void json_str(const char *s)
 static void json_event(const event_t *e)
 {
     static const char *type_str[] = {
-        [EVENT_EXEC]    = "EXEC",
-        [EVENT_OPEN]    = "OPEN",
-        [EVENT_EXIT]    = "EXIT",
-        [EVENT_CONNECT] = "CONNECT",
-        [EVENT_UNLINK]  = "UNLINK",
-        [EVENT_RENAME]  = "RENAME",
-        [EVENT_CHMOD]   = "CHMOD",
-        [EVENT_BIND]    = "BIND",
-        [EVENT_PTRACE]  = "PTRACE",
+        [EVENT_EXEC]        = "EXEC",
+        [EVENT_OPEN]        = "OPEN",
+        [EVENT_EXIT]        = "EXIT",
+        [EVENT_CONNECT]     = "CONNECT",
+        [EVENT_UNLINK]      = "UNLINK",
+        [EVENT_RENAME]      = "RENAME",
+        [EVENT_CHMOD]       = "CHMOD",
+        [EVENT_BIND]        = "BIND",
+        [EVENT_PTRACE]      = "PTRACE",
+        [EVENT_DNS]         = "DNS",
+        [EVENT_SEND]        = "SEND",
+        [EVENT_WRITE_CLOSE] = "WRITE_CLOSE",
+        [EVENT_PRIVESC]     = "PRIVESC",
+        [EVENT_MEMEXEC]     = "MEMEXEC",
+        [EVENT_KMOD_LOAD]   = "KMOD_LOAD",
+        [EVENT_NET_CORR]    = "NET_CORR",
+        [EVENT_RATE_LIMIT]  = "RATE_LIMIT",
+        [EVENT_THREAT_INTEL]= "THREAT_INTEL",
+        [EVENT_TLS_SNI]     = "TLS_SNI",
+        [EVENT_PROC_SCRAPE] = "PROC_SCRAPE",
+        [EVENT_NS_ESCAPE]   = "NS_ESCAPE",
     };
 
     char chain[LINEAGE_BUF];
@@ -331,6 +407,7 @@ static void json_event(const event_t *e)
         break;
     case EVENT_OPEN:
         fprintf(OUT, ",\"filename\":"); json_str(e->filename);
+        fprintf(OUT, ",\"open_flags\":%u", e->open_flags);
         break;
     case EVENT_EXIT:
         fprintf(OUT, ",\"exit_code\":%d", e->exit_code);
@@ -374,6 +451,68 @@ static void json_event(const event_t *e)
         fprintf(OUT, ",\"ptrace_req\":%d,\"target_pid\":%d",
                e->ptrace_req, e->target_pid);
         break;
+    case EVENT_DNS: {
+        int  af = (e->family == 2) ? AF_INET : AF_INET6;
+        char ip[INET6_ADDRSTRLEN] = {};
+        inet_ntop(af, e->daddr, ip, sizeof(ip));
+        fprintf(OUT, ",\"query\":"); json_str(e->filename);
+        fprintf(OUT, ",\"family\":%u,\"daddr\":\"%s\",\"dport\":%u",
+                e->family, ip, e->dport);
+        break;
+    }
+    case EVENT_SEND: {
+        int  af = (e->family == 2) ? AF_INET : AF_INET6;
+        char ip[INET6_ADDRSTRLEN] = {};
+        inet_ntop(af, e->daddr, ip, sizeof(ip));
+        fprintf(OUT, ",\"family\":%u,\"daddr\":\"%s\",\"dport\":%u",
+                e->family, ip, e->dport);
+        fprintf(OUT, ",\"payload_len\":%u", e->mode);
+        break;
+    }
+    case EVENT_WRITE_CLOSE:
+        fprintf(OUT, ",\"filename\":"); json_str(e->filename);
+        break;
+    case EVENT_PRIVESC:
+        fprintf(OUT, ",\"uid_before\":%u,\"uid_after\":%u,\"cap_data\":%llu",
+                e->uid_before, e->uid_after, (unsigned long long)e->cap_data);
+        break;
+    case EVENT_MEMEXEC:
+        fprintf(OUT, ",\"prot\":\"0x%x\",\"mmap_flags\":\"0x%x\"",
+                e->mode, e->open_flags);
+        if (e->filename[0]) { fprintf(OUT, ",\"filename\":"); json_str(e->filename); }
+        break;
+    case EVENT_KMOD_LOAD:
+        fprintf(OUT, ",\"filename\":"); json_str(e->filename[0] ? e->filename : "");
+        break;
+    case EVENT_NET_CORR: {
+        int  af = (e->family == 2) ? AF_INET : AF_INET6;
+        char ip[INET6_ADDRSTRLEN] = {};
+        inet_ntop(af, e->daddr, ip, sizeof(ip));
+        fprintf(OUT, ",\"dns_name\":"); json_str(e->dns_name);
+        fprintf(OUT, ",\"daddr\":\"%s\",\"dport\":%u", ip, e->dport);
+        break;
+    }
+    case EVENT_RATE_LIMIT:
+        fprintf(OUT, ",\"limited_pid\":%d", e->pid);
+        break;
+    case EVENT_THREAT_INTEL: {
+        int  af = (e->family == 2) ? AF_INET : AF_INET6;
+        char ip[INET6_ADDRSTRLEN] = {};
+        inet_ntop(af, e->daddr, ip, sizeof(ip));
+        fprintf(OUT, ",\"family\":%u,\"daddr\":\"%s\",\"dport\":%u",
+                e->family, ip, e->dport);
+        break;
+    }
+    case EVENT_TLS_SNI:
+        fprintf(OUT, ",\"sni\":"); json_str(e->dns_name);
+        break;
+    case EVENT_PROC_SCRAPE:
+        fprintf(OUT, ",\"target_pid\":%d,\"path\":", e->target_pid);
+        json_str(e->filename);
+        break;
+    case EVENT_NS_ESCAPE:
+        fprintf(OUT, ",\"ns_flags\":\"0x%x\"", e->mode);
+        break;
     }
     fputs("}\n", OUT);
 }
@@ -383,11 +522,17 @@ static void json_event(const event_t *e)
 static void syslog_event(const event_t *e)
 {
     static const char *type_str[] = {
-        [EVENT_EXEC]    = "EXEC",    [EVENT_OPEN]    = "OPEN",
-        [EVENT_EXIT]    = "EXIT",    [EVENT_CONNECT] = "CONNECT",
-        [EVENT_UNLINK]  = "UNLINK",  [EVENT_RENAME]  = "RENAME",
-        [EVENT_CHMOD]   = "CHMOD",   [EVENT_BIND]    = "BIND",
-        [EVENT_PTRACE]  = "PTRACE",
+        [EVENT_EXEC]        = "EXEC",        [EVENT_OPEN]        = "OPEN",
+        [EVENT_EXIT]        = "EXIT",        [EVENT_CONNECT]     = "CONNECT",
+        [EVENT_UNLINK]      = "UNLINK",      [EVENT_RENAME]      = "RENAME",
+        [EVENT_CHMOD]       = "CHMOD",       [EVENT_BIND]        = "BIND",
+        [EVENT_PTRACE]      = "PTRACE",      [EVENT_DNS]         = "DNS",
+        [EVENT_SEND]        = "SEND",        [EVENT_WRITE_CLOSE] = "WRITE_CLOSE",
+        [EVENT_PRIVESC]     = "PRIVESC",     [EVENT_MEMEXEC]     = "MEMEXEC",
+        [EVENT_KMOD_LOAD]   = "KMOD_LOAD",   [EVENT_NET_CORR]    = "NET_CORR",
+        [EVENT_RATE_LIMIT]  = "RATE_LIMIT",  [EVENT_THREAT_INTEL]= "THREAT_INTEL",
+        [EVENT_TLS_SNI]     = "TLS_SNI",     [EVENT_PROC_SCRAPE] = "PROC_SCRAPE",
+        [EVENT_NS_ESCAPE]   = "NS_ESCAPE",
     };
 
     char chain[LINEAGE_BUF];
@@ -451,12 +596,273 @@ static void syslog_event(const event_t *e)
         snprintf(detail, sizeof(detail), "[%s] req=%d target_pid=%d",
                  e->success ? "OK" : "FAIL", e->ptrace_req, e->target_pid);
         break;
+    case EVENT_DNS: {
+        int  af = (e->family == 2) ? AF_INET : AF_INET6;
+        char ip[INET6_ADDRSTRLEN] = {};
+        inet_ntop(af, e->daddr, ip, sizeof(ip));
+        snprintf(detail, sizeof(detail), "[%s] query=%s dst=%s:%u",
+                 e->success ? "OK" : "FAIL", e->filename, ip, e->dport);
+        break;
+    }
+    case EVENT_SEND: {
+        int  af = (e->family == 2) ? AF_INET : AF_INET6;
+        char ip[INET6_ADDRSTRLEN] = {};
+        inet_ntop(af, e->daddr, ip, sizeof(ip));
+        snprintf(detail, sizeof(detail), "[%s] dst=%s:%u len=%u",
+                 e->success ? "OK" : "FAIL", ip, e->dport, e->mode);
+        break;
+    }
+    case EVENT_WRITE_CLOSE:
+        snprintf(detail, sizeof(detail), "%s", e->filename);
+        break;
+    case EVENT_PRIVESC:
+        snprintf(detail, sizeof(detail), "uid %u->%u caps=0x%llx",
+                 e->uid_before, e->uid_after, (unsigned long long)e->cap_data);
+        break;
+    case EVENT_MEMEXEC:
+        snprintf(detail, sizeof(detail), "prot=0x%x flags=0x%x %s",
+                 e->mode, e->open_flags,
+                 e->filename[0] ? e->filename : "<anon>");
+        break;
+    case EVENT_KMOD_LOAD:
+        snprintf(detail, sizeof(detail), "%s",
+                 e->filename[0] ? e->filename : "<anonymous>");
+        break;
+    case EVENT_NET_CORR: {
+        int  af = (e->family == 2) ? AF_INET : AF_INET6;
+        char ip[INET6_ADDRSTRLEN] = {};
+        inet_ntop(af, e->daddr, ip, sizeof(ip));
+        snprintf(detail, sizeof(detail), "dns=%s -> %s:%u",
+                 e->dns_name, ip, e->dport);
+        break;
+    }
+    case EVENT_RATE_LIMIT:
+        snprintf(detail, sizeof(detail), "pid=%d rate-limited", e->pid);
+        break;
+    case EVENT_THREAT_INTEL: {
+        int  af = (e->family == 2) ? AF_INET : AF_INET6;
+        char ip[INET6_ADDRSTRLEN] = {};
+        inet_ntop(af, e->daddr, ip, sizeof(ip));
+        snprintf(detail, sizeof(detail), "[BLOCKED] %s:%u", ip, e->dport);
+        break;
+    }
+    case EVENT_TLS_SNI:
+        snprintf(detail, sizeof(detail), "sni=%s", e->dns_name);
+        break;
+    case EVENT_PROC_SCRAPE:
+        snprintf(detail, sizeof(detail), "target_pid=%d path=%s",
+                 e->target_pid, e->filename);
+        break;
+    case EVENT_NS_ESCAPE:
+        snprintf(detail, sizeof(detail), "ns_flags=0x%x", e->mode);
+        break;
     }
 
     syslog(LOG_INFO,
            "type=%s pid=%d ppid=%d uid=%u comm=%s cgroup=%s lineage=%s %s",
            ts, e->pid, e->ppid, e->uid, e->comm,
            e->cgroup[0] ? e->cgroup : "-", chain, detail);
+}
+
+/* ── CEF output ─────────────────────────────────────────────────────────── */
+/*
+ * ArcSight Common Event Format v0.
+ * Header: CEF:0|Vendor|Product|Version|SignatureID|Name|Severity|Extension
+ * Extension: space-separated key=value pairs.
+ *   Header field escaping : | → \|  \ → \\
+ *   Extension value escaping: = → \=  \ → \\  \n → \\n
+ */
+
+static void cef_hdr_str(const char *s)
+{
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p == '|' || *p == '\\') fputc('\\', OUT);
+        fputc(*p, OUT);
+    }
+}
+
+static void cef_ext_val(const char *s)
+{
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p == '\\') { fprintf(OUT, "\\\\"); continue; }
+        if (*p == '=')  { fprintf(OUT, "\\=");  continue; }
+        if (*p == '\n') { fprintf(OUT, "\\n");  continue; }
+        fputc(*p, OUT);
+    }
+}
+
+static void cef_event(const event_t *e)
+{
+    static const struct { const char *id; const char *name; int sev; } meta[] = {
+        [EVENT_EXEC]        = {"EXEC",         "Process Execution",        3},
+        [EVENT_OPEN]        = {"OPEN",         "File Open",                3},
+        [EVENT_EXIT]        = {"EXIT",         "Process Exit",             0},
+        [EVENT_CONNECT]     = {"CONNECT",      "Network Connection",       3},
+        [EVENT_UNLINK]      = {"UNLINK",       "File Deletion",            5},
+        [EVENT_RENAME]      = {"RENAME",       "File Rename",              5},
+        [EVENT_CHMOD]       = {"CHMOD",        "Permission Change",        5},
+        [EVENT_BIND]        = {"BIND",         "Socket Bind",              3},
+        [EVENT_PTRACE]      = {"PTRACE",       "Ptrace Call",              8},
+        [EVENT_DNS]         = {"DNS",          "DNS Query",                3},
+        [EVENT_SEND]        = {"SEND",         "Network Send",             3},
+        [EVENT_WRITE_CLOSE] = {"WRITE_CLOSE",  "File Write-Close",         3},
+        [EVENT_PRIVESC]     = {"PRIVESC",      "Privilege Escalation",     9},
+        [EVENT_MEMEXEC]     = {"MEMEXEC",      "Memory Exec Mapping",      8},
+        [EVENT_KMOD_LOAD]   = {"KMOD_LOAD",    "Kernel Module Load",       9},
+        [EVENT_NET_CORR]    = {"NET_CORR",     "DNS-Connect Correlation",  5},
+        [EVENT_RATE_LIMIT]  = {"RATE_LIMIT",   "Rate Limit Hit",           2},
+        [EVENT_THREAT_INTEL]= {"THREAT_INTEL", "Threat Intel Match",       9},
+        [EVENT_TLS_SNI]     = {"TLS_SNI",      "TLS SNI Observed",         3},
+        [EVENT_PROC_SCRAPE] = {"PROC_SCRAPE",  "Proc Scraping Detected",   8},
+        [EVENT_NS_ESCAPE]   = {"NS_ESCAPE",    "Namespace Escape",         9},
+    };
+
+    if (e->type >= EVENT_TYPE_MAX) return;
+    const char *sig  = meta[e->type].id;
+    const char *name = meta[e->type].name;
+    int         sev  = meta[e->type].sev;
+
+    /* Header */
+    fprintf(OUT, "CEF:0|argus|argus|");
+    cef_hdr_str(ARGUS_VERSION);
+    fputc('|', OUT);
+    cef_hdr_str(sig);
+    fputc('|', OUT);
+    cef_hdr_str(name);
+    fprintf(OUT, "|%d|", sev);
+
+    /* Extension: common fields */
+    fprintf(OUT, "spid=%d suid=%u sgid=%u dproc=", e->pid, e->uid, e->gid);
+    cef_ext_val(e->comm);
+
+    const char *uname = uid_name(e->uid);
+    if (uname) { fprintf(OUT, " suser="); cef_ext_val(uname); }
+
+    char chain[LINEAGE_BUF];
+    lineage_str(e->ppid, chain, sizeof(chain));
+    fprintf(OUT, " flexString1Label=lineage flexString1=");
+    cef_ext_val(chain);
+
+    if (e->cgroup[0]) { fprintf(OUT, " cs1Label=cgroup cs1="); cef_ext_val(e->cgroup); }
+
+    /* Extension: type-specific fields */
+    switch (e->type) {
+    case EVENT_EXEC:
+        fprintf(OUT, " fname="); cef_ext_val(e->filename);
+        fprintf(OUT, " cs2Label=args cs2="); cef_ext_val(e->args);
+        break;
+    case EVENT_OPEN:
+        fprintf(OUT, " fname="); cef_ext_val(e->filename);
+        fprintf(OUT, " outcome=%s", e->success ? "Success" : "Failure");
+        break;
+    case EVENT_EXIT:
+        fprintf(OUT, " reason=exit_code=%d", e->exit_code);
+        break;
+    case EVENT_CONNECT: {
+        int  af = (e->family == 2) ? AF_INET : AF_INET6;
+        char ip[INET6_ADDRSTRLEN] = {};
+        char host[256] = {};
+        inet_ntop(af, e->daddr, ip, sizeof(ip));
+        dns_lookup(e->daddr, af, host, sizeof(host));
+        fprintf(OUT, " dst="); cef_ext_val(ip);
+        fprintf(OUT, " dpt=%u", e->dport);
+        if (strcmp(host, ip) != 0) { fprintf(OUT, " dhost="); cef_ext_val(host); }
+        fprintf(OUT, " outcome=%s", e->success ? "Success" : "Failure");
+        break;
+    }
+    case EVENT_BIND: {
+        int  af = (e->family == 2) ? AF_INET : AF_INET6;
+        char ip[INET6_ADDRSTRLEN] = {};
+        inet_ntop(af, e->daddr, ip, sizeof(ip));
+        fprintf(OUT, " src="); cef_ext_val(ip);
+        fprintf(OUT, " spt=%u", e->dport);
+        fprintf(OUT, " outcome=%s", e->success ? "Success" : "Failure");
+        break;
+    }
+    case EVENT_UNLINK:
+        fprintf(OUT, " fname="); cef_ext_val(e->filename);
+        fprintf(OUT, " outcome=%s", e->success ? "Success" : "Failure");
+        break;
+    case EVENT_RENAME:
+        fprintf(OUT, " fname="); cef_ext_val(e->filename);
+        fprintf(OUT, " cs2Label=new_path cs2="); cef_ext_val(e->args);
+        fprintf(OUT, " outcome=%s", e->success ? "Success" : "Failure");
+        break;
+    case EVENT_CHMOD:
+        fprintf(OUT, " fname="); cef_ext_val(e->filename);
+        fprintf(OUT, " cs2Label=mode cs2=0%o", e->mode);
+        fprintf(OUT, " outcome=%s", e->success ? "Success" : "Failure");
+        break;
+    case EVENT_PTRACE:
+        fprintf(OUT, " cs2Label=ptrace_req cs2=%d cs3Label=target_pid cs3=%d",
+                e->ptrace_req, e->target_pid);
+        fprintf(OUT, " outcome=%s", e->success ? "Success" : "Failure");
+        break;
+    case EVENT_DNS: {
+        int  af = (e->family == 2) ? AF_INET : AF_INET6;
+        char ip[INET6_ADDRSTRLEN] = {};
+        inet_ntop(af, e->daddr, ip, sizeof(ip));
+        fprintf(OUT, " dnsQuery="); cef_ext_val(e->filename);
+        fprintf(OUT, " dst=%s dpt=%u", ip, e->dport);
+        fprintf(OUT, " outcome=%s", e->success ? "Success" : "Failure");
+        break;
+    }
+    case EVENT_SEND: {
+        int  af = (e->family == 2) ? AF_INET : AF_INET6;
+        char ip[INET6_ADDRSTRLEN] = {};
+        inet_ntop(af, e->daddr, ip, sizeof(ip));
+        fprintf(OUT, " dst=%s dpt=%u cn1Label=payload_len cn1=%u",
+                ip, e->dport, e->mode);
+        fprintf(OUT, " outcome=%s", e->success ? "Success" : "Failure");
+        break;
+    }
+    case EVENT_WRITE_CLOSE:
+        fprintf(OUT, " fname="); cef_ext_val(e->filename);
+        break;
+    case EVENT_PRIVESC:
+        fprintf(OUT, " cs2Label=uid_before cs2=%u cs3Label=uid_after cs3=%u"
+                     " cn1Label=cap_data cn1=%llu",
+                e->uid_before, e->uid_after, (unsigned long long)e->cap_data);
+        break;
+    case EVENT_MEMEXEC:
+        fprintf(OUT, " cs2Label=prot cs2=0x%x cs3Label=mmap_flags cs3=0x%x",
+                e->mode, e->open_flags);
+        if (e->filename[0]) { fprintf(OUT, " fname="); cef_ext_val(e->filename); }
+        break;
+    case EVENT_KMOD_LOAD:
+        fprintf(OUT, " fname=");
+        cef_ext_val(e->filename[0] ? e->filename : "<anonymous>");
+        break;
+    case EVENT_NET_CORR: {
+        int  af = (e->family == 2) ? AF_INET : AF_INET6;
+        char ip[INET6_ADDRSTRLEN] = {};
+        inet_ntop(af, e->daddr, ip, sizeof(ip));
+        fprintf(OUT, " cs2Label=dns_name cs2="); cef_ext_val(e->dns_name);
+        fprintf(OUT, " dst=%s dpt=%u", ip, e->dport);
+        break;
+    }
+    case EVENT_RATE_LIMIT:
+        fprintf(OUT, " cs2Label=limited_pid cs2=%d", e->pid);
+        break;
+    case EVENT_THREAT_INTEL: {
+        int  af = (e->family == 2) ? AF_INET : AF_INET6;
+        char ip[INET6_ADDRSTRLEN] = {};
+        inet_ntop(af, e->daddr, ip, sizeof(ip));
+        fprintf(OUT, " dst=%s dpt=%u outcome=Blocked", ip, e->dport);
+        break;
+    }
+    case EVENT_TLS_SNI:
+        fprintf(OUT, " cs2Label=sni cs2="); cef_ext_val(e->dns_name);
+        break;
+    case EVENT_PROC_SCRAPE:
+        fprintf(OUT, " cs2Label=target_pid cs2=%d fname=", e->target_pid);
+        cef_ext_val(e->filename);
+        break;
+    case EVENT_NS_ESCAPE:
+        fprintf(OUT, " cs2Label=ns_flags cs2=0x%x", e->mode);
+        break;
+    }
+    fputc('\n', OUT);
 }
 
 /* ── summary mode ───────────────────────────────────────────────────────── */
@@ -614,6 +1020,8 @@ void print_event(const event_t *e)
         json_event(e);
     else if (g_fmt == OUTPUT_SYSLOG)
         syslog_event(e);
+    else if (g_fmt == OUTPUT_CEF)
+        cef_event(e);
     else
         text_event(e);
 }
@@ -630,6 +1038,9 @@ void print_drops(uint64_t count)
     else if (g_fmt == OUTPUT_SYSLOG)
         syslog(LOG_WARNING, "dropped %llu event(s) — ring buffer full",
                (unsigned long long)count);
+    else if (g_fmt == OUTPUT_CEF)
+        fprintf(OUT, "CEF:0|argus|argus|%s|DROP|Ring Buffer Drop|5|cnt=%llu\n",
+                ARGUS_VERSION, (unsigned long long)count);
     else
         fprintf(stderr, "[WARNING: %llu event(s) dropped — ring buffer full]\n",
                 (unsigned long long)count);

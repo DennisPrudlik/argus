@@ -1,11 +1,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <syslog.h>
 #include <arpa/inet.h>
+#ifdef __linux__
+#include <bpf/bpf.h>
+#endif
 #include "rules.h"
 #include "output.h"
 #include "argus.h"
+#include "metrics.h"
+#include "lineage.h"
 
 #define RULES_MAX 64
 
@@ -34,15 +40,41 @@ typedef struct {
     char       name[64];
     char       message[256];
     severity_t severity;
-    int        event_type;        /* -1 = any; otherwise EVENT_* value */
-    char       comm[16];          /* "" = any */
-    int        uid;               /* -1 = any */
-    char       path_contains[128];/* "" = any */
-    uint32_t   mode_mask;         /* 0 = skip; flag if (mode & mask) != 0 */
+    int        event_type;           /* -1 = any; otherwise EVENT_* value */
+    char       comm[16];             /* "" = any */
+    int        uid;                  /* -1 = any */
+    char       path_contains[128];   /* "" = any */
+    uint32_t   mode_mask;            /* 0 = skip; flag if (mode & mask) != 0 */
+
+    /* ── Suppression / threshold ────────────────────────────────────────── */
+    int        threshold_count;      /* min hits before alert fires (0/1=always) */
+    int        threshold_window_secs;/* rolling window for hit counting (0=any)  */
+    int        suppress_after_secs;  /* suppress for N secs after threshold met   */
+
+    /* ── Lineage matching ───────────────────────────────────────────────── */
+    char       parent_comm[16];      /* "" = any; match immediate parent comm    */
+    char       ancestor_comm[16];    /* "" = any; match any ancestor comm        */
+
+    /* ── Active response ────────────────────────────────────────────────── */
+    char       action[16];           /* "" = alert only; "kill" = send SIGKILL  */
 } rule_t;
 
-static rule_t g_rules[RULES_MAX];
-static int    g_rule_count = 0;
+/* Per-rule runtime state — parallel to g_rules[] */
+#define RULE_HIT_HISTORY 64
+
+typedef struct {
+    time_t hit_times[RULE_HIT_HISTORY]; /* circular buffer of match timestamps */
+    int    hit_pos;                     /* next write position                   */
+    int    hit_total;                   /* lifetime hits                         */
+    time_t suppressed_until;            /* 0 = not suppressed                    */
+} rule_state_t;
+
+static rule_t       g_rules[RULES_MAX];
+static rule_state_t g_state[RULES_MAX];
+static int          g_rule_count = 0;
+static int          g_kill_fd    = -1;   /* fd of kill_list BPF map; -1 = not set */
+
+void rules_set_kill_fd(int fd) { g_kill_fd = fd; }
 
 int rules_count(void) { return g_rule_count; }
 
@@ -50,6 +82,7 @@ void rules_free(void)
 {
     g_rule_count = 0;
     memset(g_rules, 0, sizeof(g_rules));
+    memset(g_state, 0, sizeof(g_state));
 }
 
 /* ── minimal JSON parser ─────────────────────────────────────────────────── */
@@ -105,15 +138,27 @@ static severity_t parse_severity(const char *s)
 
 static int parse_event_type_str(const char *s)
 {
-    if (strcmp(s, "EXEC")    == 0) return EVENT_EXEC;
-    if (strcmp(s, "OPEN")    == 0) return EVENT_OPEN;
-    if (strcmp(s, "EXIT")    == 0) return EVENT_EXIT;
-    if (strcmp(s, "CONNECT") == 0) return EVENT_CONNECT;
-    if (strcmp(s, "UNLINK")  == 0) return EVENT_UNLINK;
-    if (strcmp(s, "RENAME")  == 0) return EVENT_RENAME;
-    if (strcmp(s, "CHMOD")   == 0) return EVENT_CHMOD;
-    if (strcmp(s, "BIND")    == 0) return EVENT_BIND;
-    if (strcmp(s, "PTRACE")  == 0) return EVENT_PTRACE;
+    if (strcmp(s, "EXEC")        == 0) return EVENT_EXEC;
+    if (strcmp(s, "OPEN")        == 0) return EVENT_OPEN;
+    if (strcmp(s, "EXIT")        == 0) return EVENT_EXIT;
+    if (strcmp(s, "CONNECT")     == 0) return EVENT_CONNECT;
+    if (strcmp(s, "UNLINK")      == 0) return EVENT_UNLINK;
+    if (strcmp(s, "RENAME")      == 0) return EVENT_RENAME;
+    if (strcmp(s, "CHMOD")       == 0) return EVENT_CHMOD;
+    if (strcmp(s, "BIND")        == 0) return EVENT_BIND;
+    if (strcmp(s, "PTRACE")      == 0) return EVENT_PTRACE;
+    if (strcmp(s, "DNS")         == 0) return EVENT_DNS;
+    if (strcmp(s, "SEND")        == 0) return EVENT_SEND;
+    if (strcmp(s, "WRITE_CLOSE")  == 0) return EVENT_WRITE_CLOSE;
+    if (strcmp(s, "PRIVESC")      == 0) return EVENT_PRIVESC;
+    if (strcmp(s, "MEMEXEC")      == 0) return EVENT_MEMEXEC;
+    if (strcmp(s, "KMOD_LOAD")    == 0) return EVENT_KMOD_LOAD;
+    if (strcmp(s, "NET_CORR")     == 0) return EVENT_NET_CORR;
+    if (strcmp(s, "RATE_LIMIT")   == 0) return EVENT_RATE_LIMIT;
+    if (strcmp(s, "THREAT_INTEL") == 0) return EVENT_THREAT_INTEL;
+    if (strcmp(s, "TLS_SNI")      == 0) return EVENT_TLS_SNI;
+    if (strcmp(s, "PROC_SCRAPE")  == 0) return EVENT_PROC_SCRAPE;
+    if (strcmp(s, "NS_ESCAPE")    == 0) return EVENT_NS_ESCAPE;
     return -1;
 }
 
@@ -186,6 +231,18 @@ int rules_load(const char *path)
                 p = parse_int(p, &v);
                 r->mode_mask = (uint32_t)v;
             }
+            else if (strcmp(key, "threshold_count") == 0)
+                p = parse_int(p, &r->threshold_count);
+            else if (strcmp(key, "threshold_window_secs") == 0)
+                p = parse_int(p, &r->threshold_window_secs);
+            else if (strcmp(key, "suppress_after_secs") == 0)
+                p = parse_int(p, &r->suppress_after_secs);
+            else if (strcmp(key, "parent_comm") == 0)
+                p = parse_str(p, r->parent_comm, sizeof(r->parent_comm));
+            else if (strcmp(key, "ancestor_comm") == 0)
+                p = parse_str(p, r->ancestor_comm, sizeof(r->ancestor_comm));
+            else if (strcmp(key, "action") == 0)
+                p = parse_str(p, r->action, sizeof(r->action));
 
             p = skip_ws(p);
             if (*p == ',') p++;
@@ -242,6 +299,9 @@ static void expand_message(const rule_t *r, const event_t *e,
         else if (strcmp(var, "lport")      == 0) snprintf(val, sizeof(val), "%u",  e->dport);
         else if (strcmp(var, "daddr") == 0 || strcmp(var, "laddr") == 0)
             inet_ntop(e->family == 2 ? AF_INET : AF_INET6, e->daddr, val, sizeof(val));
+        else if (strcmp(var, "uid_before") == 0) snprintf(val, sizeof(val), "%u", e->uid_before);
+        else if (strcmp(var, "uid_after")  == 0) snprintf(val, sizeof(val), "%u", e->uid_after);
+        else if (strcmp(var, "dns_name")   == 0) snprintf(val, sizeof(val), "%s", e->dns_name);
         else
             snprintf(val, sizeof(val), "{%s}", var);  /* unknown: keep literal */
 
@@ -269,6 +329,19 @@ static int rule_matches(const rule_t *r, const event_t *e)
     if (r->mode_mask && e->type == EVENT_CHMOD &&
         (e->mode & r->mode_mask) == 0)
         return 0;
+
+    /* ── Lineage checks ─────────────────────────────────────────────────── */
+    if (r->parent_comm[0]) {
+        char pcomm[16] = {};
+        lineage_parent_comm((uint32_t)e->ppid, pcomm, sizeof(pcomm));
+        if (strncmp(pcomm, r->parent_comm, sizeof(r->parent_comm)) != 0)
+            return 0;
+    }
+    if (r->ancestor_comm[0]) {
+        if (!lineage_has_ancestor((uint32_t)e->ppid, r->ancestor_comm))
+            return 0;
+    }
+
     return 1;
 }
 
@@ -323,11 +396,77 @@ static void emit_alert(const rule_t *r, const event_t *e)
     }
 }
 
+/* ── suppression / threshold logic ──────────────────────────────────────── */
+
+/*
+ * Record a hit and decide whether to fire the alert.
+ * Returns 1 if alert should fire, 0 if suppressed or threshold not met.
+ */
+static int should_fire(rule_t *r, rule_state_t *st)
+{
+    time_t now = time(NULL);
+
+    /* Currently suppressed? */
+    if (st->suppressed_until && now < st->suppressed_until)
+        return 0;
+    if (st->suppressed_until && now >= st->suppressed_until)
+        st->suppressed_until = 0;   /* lift suppression */
+
+    /* Record this hit in the circular buffer */
+    st->hit_times[st->hit_pos % RULE_HIT_HISTORY] = now;
+    st->hit_pos++;
+    st->hit_total++;
+
+    /* Check threshold (if configured) */
+    int thr = r->threshold_count;
+    if (thr <= 1) thr = 1;   /* default: fire on first hit */
+
+    if (r->threshold_window_secs > 0) {
+        /* Count hits within the window */
+        int window_hits = 0;
+        for (int k = 0; k < RULE_HIT_HISTORY; k++) {
+            if (st->hit_times[k] &&
+                now - st->hit_times[k] <= r->threshold_window_secs)
+                window_hits++;
+        }
+        if (window_hits < thr)
+            return 0;
+    } else {
+        if (st->hit_total < thr)
+            return 0;
+    }
+
+    /* Threshold met — fire.  Now apply suppress_after if configured. */
+    if (r->suppress_after_secs > 0) {
+        /* Count hits in the window again to decide when to start suppression */
+        int window_hits = r->threshold_window_secs > 0 ? thr : st->hit_total;
+        if (window_hits >= thr)
+            st->suppressed_until = now + r->suppress_after_secs;
+    }
+
+    return 1;
+}
+
 /* ── public API ──────────────────────────────────────────────────────────── */
 
 void rules_check(const event_t *e)
 {
-    for (int i = 0; i < g_rule_count; i++)
-        if (rule_matches(&g_rules[i], e))
-            emit_alert(&g_rules[i], e);
+    for (int i = 0; i < g_rule_count; i++) {
+        if (!rule_matches(&g_rules[i], e))
+            continue;
+        if (!should_fire(&g_rules[i], &g_state[i]))
+            continue;
+        emit_alert(&g_rules[i], e);
+        metrics_rule_hit();
+
+        /* Active response: kill the offending process via BPF kill_list map */
+        if (g_kill_fd >= 0 && g_rules[i].action[0] &&
+            strcmp(g_rules[i].action, "kill") == 0) {
+#ifdef __linux__
+            uint32_t pid = (uint32_t)e->pid;
+            uint8_t  val = 1;
+            bpf_map_update_elem(g_kill_fd, &pid, &val, BPF_ANY);
+#endif
+        }
+    }
 }

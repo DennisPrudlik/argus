@@ -9,6 +9,7 @@ typedef enum {
     OUTPUT_TEXT   = 0,
     OUTPUT_JSON   = 1,
     OUTPUT_SYSLOG = 2,
+    OUTPUT_CEF    = 3,   /* ArcSight Common Event Format — SIEM-ready */
 } output_fmt_t;
 
 typedef struct {

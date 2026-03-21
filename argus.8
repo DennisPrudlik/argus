@@ -1,0 +1,440 @@
+.TH ARGUS 8 "2026-03-21" "argus 0.1.0" "System Administration"
+.SH NAME
+argus \- eBPF-based Linux syscall telemetry daemon
+.SH SYNOPSIS
+.B argus
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B argus
+is a lightweight Linux kernel telemetry tool built on eBPF.
+It traces process execution, file opens, network connections, file
+deletions, renames, permission changes, socket binds, and ptrace calls
+system-wide with minimal overhead.
+.PP
+Every event carries the full process ancestry
+.RB ( systemd\(->sshd\(->bash\(->curl )
+and the container cgroup name for immediate container attribution.
+.PP
+After all BPF programs are attached and the ring buffer file descriptor is
+open, argus drops from root to
+.B nobody
+so the event loop runs with minimal privilege.
+A seccomp denylist filter is then applied that prevents the event-loop code
+from executing new programs, forking processes, calling ptrace, or changing
+credentials even if the process is exploited.
+.SH OPTIONS
+.TP
+.BI \-\-config " path"
+Load a JSON configuration file.
+Argus loads
+.I /etc/argus/config.json
+and
+.I ~/.config/argus/config.json
+automatically at startup.
+CLI flags always override config file values.
+.TP
+.BI \-\-pid " pid"
+Only trace this PID (enforced in kernel via BPF map).
+.TP
+.BI \-\-follow " pid"
+Trace
+.I pid
+and all descendant processes.
+The BPF
+.B sched_process_fork
+tracepoint propagates the tracked set automatically.
+.TP
+.BI \-\-comm " name"
+Only trace processes whose comm equals
+.I name
+(enforced in kernel).
+.TP
+.BI \-\-path " str"
+Only show events whose filename contains
+.I str
+(userspace filter).
+.TP
+.BI \-\-exclude " prefix"
+Exclude file events (OPEN, UNLINK, RENAME, CHMOD) whose path starts with
+.I prefix
+(userspace filter, repeatable up to 8 times).
+.TP
+.BI \-\-events " list"
+Comma-separated list of event types to trace.
+Valid types:
+.BR EXEC ,
+.BR OPEN ,
+.BR EXIT ,
+.BR CONNECT ,
+.BR UNLINK ,
+.BR RENAME ,
+.BR CHMOD ,
+.BR BIND ,
+.BR PTRACE .
+Specifying this flag prevents unused BPF programs from loading entirely.
+.TP
+.BI \-\-ringbuf " kb"
+Ring buffer size in KB (default: 256, range: 4\-65536).
+Increase on high-event-rate hosts if drop warnings appear.
+.TP
+.BI \-\-summary " secs"
+Print a rolling summary every
+.I secs
+seconds instead of per-event output.
+.TP
+.BI \-\-rate\-limit " n"
+Drop events after
+.I n
+per second per comm name (0 = off, kernel-enforced token bucket).
+.TP
+.BI \-\-output " path"
+Append event stream to
+.I path
+instead of stdout.
+Compatible with all output formats.
+.TP
+.BI \-\-output\-fmt " fmt"
+Set output format.
+Valid values:
+.BR text " (default human-readable table),"
+.BR json " (newline-delimited JSON),"
+.BR syslog " (syslog via LOG_DAEMON),"
+.BR cef " (ArcSight Common Event Format for SIEM integration)."
+.TP
+.B \-\-syslog
+Emit all events to
+.BR syslog (3)
+at
+.BR LOG_DAEMON .
+Overrides
+.BR \-\-json .
+.TP
+.BI \-\-pid\-file " path"
+Write the daemon PID to
+.I path
+at startup.
+The file is removed when argus exits.
+Useful for
+.B Type=forking
+systemd services and init scripts.
+.TP
+.BI \-\-rules " path"
+Load alert rules from a JSON file.
+Matching events emit alerts to stderr (text mode) or inline
+.B {"type":"ALERT"}
+objects (JSON mode).
+Rules are reloaded on SIGHUP without restart.
+.TP
+.BI \-\-forward " host:port"
+Stream every matched event as newline-delimited JSON over a persistent TCP
+connection.
+Supports IPv4, IPv6
+.RB ( [::1]:9000 ),
+and hostnames.
+Reconnects automatically with exponential backoff (1\-30 s).
+.TP
+.B \-\-forward\-tls
+Enable TLS for the
+.B \-\-forward
+connection with server certificate verification.
+Requires OpenSSL at build time.
+.TP
+.B \-\-forward\-tls\-noverify
+Enable TLS without certificate verification
+(useful for self-signed certificates in private networks).
+.TP
+.BI \-\-baseline " path"
+Load a learnt per-comm behavioural profile from
+.I path
+and emit anomaly alerts for deviations.
+.TP
+.BI \-\-baseline\-learn " secs"
+Learn a baseline profile for
+.I secs
+seconds, then write it and stop learning.
+Combine with
+.B \-\-baseline\-out
+to control the output path.
+.TP
+.BI \-\-baseline\-out " path"
+Write the learnt profile to
+.I path
+(default:
+.IR baseline.json ).
+.TP
+.B \-\-no\-drop\-privs
+Stay root after BPF attach.
+Not recommended; intended for debugging.
+.TP
+.B \-\-json
+Emit newline-delimited JSON.
+Shorthand for
+.BR "\-\-output\-fmt json" .
+.TP
+.B \-\-config\-check
+Print the active configuration and exit without attaching BPF programs.
+.TP
+.B \-\-version
+Print the version string and exit.
+.TP
+.B \-\-help
+Show a usage summary and exit.
+.SH OUTPUT FORMATS
+.SS Text (default)
+A human-readable table with columns
+.BR TYPE ,
+.BR PID ,
+.BR PPID ,
+.BR USER ,
+.BR GID ,
+.BR COMM ,
+.BR CGROUP ,
+.BR LINEAGE ,
+and
+.BR DETAIL .
+The USER column shows the username from
+.I /etc/passwd
+when available.
+.SS JSON (--json / --output-fmt json)
+One JSON object per line (NDJSON).
+CONNECT and BIND events include a
+.B hostname
+field populated by reverse-DNS lookup.
+EXEC events include a
+.B user
+field when the uid can be resolved.
+.SS CEF (--output-fmt cef)
+ArcSight Common Event Format v0, suitable for direct ingestion by Splunk,
+ArcSight, QRadar, and other SIEMs.
+Format:
+.IR "CEF:0|argus|argus|version|SignatureID|Name|Severity|Extension" .
+.SS Syslog (--syslog / --output-fmt syslog)
+All events go to
+.BR syslog (3)
+at
+.BR LOG_INFO / LOG_DAEMON .
+Overrides file output.
+.SH EVENT TYPES
+.TP
+.B EXEC
+.BR execve (2)
+/
+.BR execveat (2)
+— process execution.
+Fields:
+.BR filename ,
+.BR args ,
+.BR duration_ns .
+.TP
+.B OPEN
+.BR openat (2)
+— file open.
+Fields:
+.BR filename ,
+.BR success ,
+.BR duration_ns .
+.TP
+.B EXIT
+.BR sched_process_exit
+— process termination.
+Field:
+.BR exit_code .
+.TP
+.B CONNECT
+.BR connect (2)
+— outbound network connection.
+Fields:
+.BR family ,
+.BR daddr ,
+.BR hostname ,
+.BR dport ,
+.BR success .
+.TP
+.B UNLINK
+.BR unlinkat (2)
+— file deletion.
+Fields:
+.BR filename ,
+.BR success .
+.TP
+.B RENAME
+.BR renameat2 (2)
+— file rename.
+Fields:
+.BR filename
+(old),
+.BR new_path ,
+.BR success .
+.TP
+.B CHMOD
+.BR fchmodat (2)
+— permission change.
+Fields:
+.BR filename ,
+.BR mode ,
+.BR success .
+.TP
+.B BIND
+.BR bind (2)
+— socket bind.
+Fields:
+.BR family ,
+.BR laddr ,
+.BR lport ,
+.BR success .
+.TP
+.B PTRACE
+.BR ptrace (2)
+— process tracing call.
+Fields:
+.BR ptrace_req ,
+.BR target_pid ,
+.BR success .
+.SH CONFIG FILE
+Argus loads
+.I /etc/argus/config.json
+then
+.I ~/.config/argus/config.json
+on startup (if present).
+All keys are optional; unset keys retain their compiled-in defaults.
+.PP
+.nf
+{
+    "pid":                  0,
+    "follow_pid":           0,
+    "comm":                 "",
+    "path":                 "",
+    "exclude_paths":        ["/proc", "/sys", "/dev"],
+    "event_types":          ["EXEC", "OPEN", "EXIT", "CONNECT",
+                             "UNLINK", "RENAME", "CHMOD", "BIND", "PTRACE"],
+    "ring_buffer_kb":       256,
+    "summary_interval":     0,
+    "rate_limit_per_comm":  0,
+    "output_path":          "",
+    "output_fmt":           "text",
+    "pid_file":             "",
+    "syslog":               false,
+    "rules":                "",
+    "forward":              "siem.internal:9000",
+    "forward_tls":          false,
+    "forward_tls_noverify": false,
+    "targets": [
+        {"addr": "siem1.corp:9000"},
+        {"addr": "siem2.corp:9000", "tls": true},
+        {"addr": "backup:9000",     "tls_noverify": true}
+    ],
+    "baseline":             "",
+    "baseline_out":         "",
+    "baseline_learn_secs":  0
+}
+.fi
+.PP
+Send
+.B SIGHUP
+to reload the config without restarting.
+.SH SECURITY
+.SS Privilege drop
+After attaching all BPF programs and opening the ring buffer,
+.B argus
+drops from root to
+.B nobody
+(uid 65534) via
+.BR setuid (2)
+/
+.BR setgid (2).
+All open file descriptors remain valid.
+Pass
+.B \-\-no\-drop\-privs
+to disable.
+.SS Seccomp filter
+Immediately after the privilege drop a seccomp BPF denylist is installed.
+The filter blocks the following syscalls with
+.BR EPERM :
+.BR execve ,
+.BR execveat ,
+.BR fork ,
+.BR vfork ,
+.BR ptrace ,
+.BR setuid ,
+.BR setgid ,
+.BR setresuid ,
+.BR setresgid ,
+.BR mount ,
+.BR init_module ,
+.BR finit_module ,
+.BR kexec_load ,
+.BR kexec_file_load .
+All other syscalls are allowed.
+The filter is combined with
+.BR PR_SET_NO_NEW_PRIVS .
+.SH SIGNALS
+.TP
+.B SIGINT / SIGTERM
+Graceful shutdown: flush baseline profile (if learning), write final drop
+count, and remove the pid-file.
+.TP
+.B SIGHUP
+Reload configuration files, update BPF filter maps (pid/comm allowlists,
+rate limit), reload alert rules, and update userspace filters.
+The event type mask and ring buffer size cannot change at runtime.
+.SH FILES
+.TP
+.I /etc/argus/config.json
+System-wide configuration file.
+.TP
+.I ~/.config/argus/config.json
+Per-user configuration file.
+.TP
+.I /etc/argus/rules.json
+Default alert rules location (configurable).
+.TP
+.I /etc/argus/baseline.json
+Default baseline profile location (configurable).
+.TP
+.I /var/log/argus/events.jsonl
+Default event log when installed as a systemd service.
+.TP
+.I /sys/kernel/btf/vmlinux
+BTF (BPF Type Format) blob required for CO-RE.
+Must exist; kernel 5.8+ with
+.B CONFIG_DEBUG_INFO_BTF=y
+required.
+.SH REQUIREMENTS
+Linux kernel 5.8 or newer with BTF enabled.
+Must run as root or with
+.B CAP_BPF
++
+.BR CAP_PERFMON .
+.SH EXAMPLES
+.TP
+Watch all process executions:
+.B sudo argus \-\-events EXEC \-\-json
+.TP
+Watch a specific process and all children it spawns:
+.B sudo argus \-\-follow $(pidof nginx | awk '{print $1}')
+.TP
+Detect anomalies (learn for 1 hour, then detect):
+.nf
+sudo argus \-\-baseline\-learn 3600 \-\-baseline\-out /etc/argus/baseline.json
+sudo argus \-\-baseline /etc/argus/baseline.json \-\-json
+.fi
+.TP
+Forward to two SIEM endpoints (one plain, one TLS):
+.nf
+sudo argus \-\-forward siem1.corp:9000 \e
+           \-\-forward siem1.corp:9001 \-\-forward\-tls
+.fi
+.TP
+CEF output for SIEM ingestion:
+.B sudo argus \-\-output\-fmt cef \-\-output /var/log/argus/events.cef
+.TP
+Run as daemon with pid-file:
+.B sudo argus \-\-pid\-file /var/run/argus.pid \-\-json \-\-output /var/log/argus/events.jsonl
+.SH SEE ALSO
+.BR bpftool (8),
+.BR strace (1),
+.BR auditd (8),
+.BR seccomp (2),
+.BR prctl (2)
+.SH AUTHOR
+argus project <https://github.com/DennisPrudlik/argus>

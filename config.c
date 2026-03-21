@@ -79,6 +79,25 @@ static const char *past_colon(const char *p)
     return skip_ws(p);
 }
 
+/* Parse a JSON double (digits with optional decimal point). */
+static const char *parse_double(const char *p, double *out)
+{
+    p = skip_ws(p);
+    if ((*p < '0' || *p > '9') && *p != '-')
+        return p;
+    double sign = 1.0;
+    if (*p == '-') { sign = -1.0; p++; }
+    double val = 0.0;
+    while (*p >= '0' && *p <= '9') { val = val * 10.0 + (*p - '0'); p++; }
+    if (*p == '.') {
+        p++;
+        double frac = 0.1;
+        while (*p >= '0' && *p <= '9') { val += (*p - '0') * frac; frac *= 0.1; p++; }
+    }
+    *out = sign * val;
+    return p;
+}
+
 /* ── event_types array parser ───────────────────────────────────────────── */
 
 static int parse_event_types(const char *p, int *mask)
@@ -118,6 +137,24 @@ static void parse_exclude_paths(const char *p, filter_t *f)
         p = parse_str(p, f->excludes[f->exclude_count], 128);
         if (f->excludes[f->exclude_count][0])
             f->exclude_count++;
+        p = skip_ws(p);
+        if (*p == ',') p++;
+        p = skip_ws(p);
+    }
+}
+
+/* ── fim_paths array parser ─────────────────────────────────────────────── */
+
+static void parse_fim_paths(const char *p, argus_cfg_t *cfg)
+{
+    p = skip_ws(p);
+    if (*p != '[') return;
+    p++;
+    while (*p && *p != ']') {
+        if (cfg->fim_path_count >= 16) break;
+        p = parse_str(p, cfg->fim_paths[cfg->fim_path_count], 256);
+        if (cfg->fim_paths[cfg->fim_path_count][0])
+            cfg->fim_path_count++;
         p = skip_ws(p);
         if (*p == ',') p++;
         p = skip_ws(p);
@@ -184,6 +221,47 @@ int cfg_load(const char *path, argus_cfg_t *cfg)
         else if (strcmp(key, "forward_tls_noverify") == 0) {
             int v = 0; p = parse_bool(p, &v); cfg->forward_tls_noverify = v;
         }
+        else if (strcmp(key, "targets") == 0) {
+            /* Array of {addr, tls, tls_noverify} forwarding targets */
+            p = skip_ws(p);
+            if (*p == '[') {
+                p++;
+                while (*p && *p != ']') {
+                    p = skip_ws(p);
+                    if (*p != '{') { p++; continue; }
+                    p++;
+                    if (cfg->forward_target_count >= CFG_MAX_TARGETS) {
+                        /* Skip the rest of this object */
+                        while (*p && *p != '}') p++;
+                        if (*p == '}') p++;
+                    } else {
+                        cfg_target_t *t = &cfg->forward_targets[cfg->forward_target_count];
+                        while (*p && *p != '}') {
+                            p = skip_ws(p);
+                            if (*p != '"') { p++; continue; }
+                            char fkey[32] = {};
+                            p = parse_str(p, fkey, sizeof(fkey));
+                            p = past_colon(p);
+                            if      (strcmp(fkey, "addr") == 0)
+                                p = parse_str(p, t->addr, sizeof(t->addr));
+                            else if (strcmp(fkey, "tls") == 0) {
+                                int v = 0; p = parse_bool(p, &v); t->tls = v;
+                            }
+                            else if (strcmp(fkey, "tls_noverify") == 0) {
+                                int v = 0; p = parse_bool(p, &v); t->tls_noverify = v;
+                            }
+                            p = skip_ws(p);
+                            if (*p == ',') p++;
+                        }
+                        if (*p == '}') p++;
+                        if (t->addr[0])
+                            cfg->forward_target_count++;
+                    }
+                    p = skip_ws(p);
+                    if (*p == ',') p++;
+                }
+            }
+        }
         else if (strcmp(key, "syslog") == 0) {
             int v = 0;
             p = parse_bool(p, &v);
@@ -193,6 +271,16 @@ int cfg_load(const char *path, argus_cfg_t *cfg)
             p = parse_str(p, cfg->output_path, sizeof(cfg->output_path));
         else if (strcmp(key, "rules") == 0)
             p = parse_str(p, cfg->rules_path, sizeof(cfg->rules_path));
+        else if (strcmp(key, "output_fmt") == 0) {
+            char v[16] = {};
+            p = parse_str(p, v, sizeof(v));
+            if      (strcmp(v, "json")   == 0) cfg->output_fmt = OUTPUT_JSON;
+            else if (strcmp(v, "syslog") == 0) cfg->output_fmt = OUTPUT_SYSLOG;
+            else if (strcmp(v, "cef")    == 0) cfg->output_fmt = OUTPUT_CEF;
+            else                               cfg->output_fmt = OUTPUT_TEXT;
+        }
+        else if (strcmp(key, "pid_file") == 0)
+            p = parse_str(p, cfg->pid_file, sizeof(cfg->pid_file));
         else if (strcmp(key, "follow_pid") == 0)
             p = parse_int(p, &cfg->follow_pid);
         else if (strcmp(key, "baseline") == 0)
@@ -201,12 +289,41 @@ int cfg_load(const char *path, argus_cfg_t *cfg)
             p = parse_str(p, cfg->baseline_out, sizeof(cfg->baseline_out));
         else if (strcmp(key, "baseline_learn_secs") == 0)
             p = parse_int(p, &cfg->baseline_learn_secs);
+        else if (strcmp(key, "baseline_merge_after") == 0)
+            p = parse_int(p, &cfg->baseline_merge_after);
+        else if (strcmp(key, "metrics_port") == 0)
+            p = parse_int(p, &cfg->metrics_port);
         else if (strcmp(key, "event_types") == 0)
             parse_event_types(p, &cfg->filter.event_mask);
         else if (strcmp(key, "exclude_paths") == 0) {
             /* Reset first so an empty array clears the defaults */
             cfg->filter.exclude_count = 0;
             parse_exclude_paths(p, &cfg->filter);
+        }
+        else if (strcmp(key, "threat_intel") == 0)
+            p = parse_str(p, cfg->threat_intel_path, sizeof(cfg->threat_intel_path));
+        else if (strcmp(key, "fim_paths") == 0)
+            parse_fim_paths(p, cfg);
+        else if (strcmp(key, "dga_entropy_threshold") == 0)
+            p = parse_double(p, &cfg->dga_entropy_threshold);
+        else if (strcmp(key, "ldpreload_check") == 0) {
+            int v = 0; p = parse_bool(p, &v); cfg->ldpreload_check = v;
+        }
+        else if (strcmp(key, "yara_rules_dir") == 0)
+            p = parse_str(p, cfg->yara_rules_dir, sizeof(cfg->yara_rules_dir));
+        else if (strcmp(key, "syscall_profile_interval") == 0)
+            p = parse_int(p, &cfg->syscall_profile_interval);
+        else if (strcmp(key, "baseline_cgroup_aware") == 0) {
+            int v = 0; p = parse_bool(p, &v); cfg->baseline_cgroup_aware = v;
+        }
+        else if (strcmp(key, "response_kill") == 0) {
+            int v = 0; p = parse_bool(p, &v); cfg->response_kill = v;
+        }
+        else if (strcmp(key, "tls_sni_enable") == 0) {
+            int v = 0; p = parse_bool(p, &v); cfg->tls_sni_enable = v;
+        }
+        else if (strcmp(key, "rate_limit_per_pid") == 0) {
+            int v = 0; p = parse_int(p, &v); cfg->rate_limit_per_pid = (uint32_t)v;
         }
 
         /* advance past current value to next key */
