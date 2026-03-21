@@ -522,6 +522,18 @@ struct {
     __type(value, struct fd_entry);
 } fd_track SEC(".maps");
 
+/*
+ * fd_entry_scratch — per-CPU staging area for struct fd_entry so it does not
+ * consume BPF stack space in handle_openat_exit (the 128-byte filename field
+ * would push the combined inlined frame past the 512-byte limit).
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, uint32_t);
+    __type(value, struct fd_entry);
+} fd_entry_scratch SEC(".maps");
+
 SEC("tracepoint/syscalls/sys_enter_openat")
 int handle_openat_enter(struct trace_event_raw_sys_enter *ctx)
 {
@@ -578,12 +590,16 @@ int handle_openat_exit(struct trace_event_raw_sys_exit *ctx)
     /*
      * Track write-mode opens so we can emit EVENT_WRITE_CLOSE on close().
      * O_WRONLY=1, O_RDWR=2; either means the file will be written.
+     * Use fd_entry_scratch (PERCPU_ARRAY) to avoid 128-byte stack allocation.
      */
     if (ctx->ret >= 0 && (os->flags & 3) != 0) {
-        struct fd_entry fe = {};
-        __builtin_memcpy(fe.filename, os->filename, sizeof(fe.filename));
-        uint64_t key = ((uint64_t)pid << 32) | (uint32_t)ctx->ret;
-        bpf_map_update_elem(&fd_track, &key, &fe, BPF_ANY);
+        uint32_t zero = 0;
+        struct fd_entry *fe = bpf_map_lookup_elem(&fd_entry_scratch, &zero);
+        if (fe) {
+            __builtin_memcpy(fe->filename, os->filename, sizeof(fe->filename));
+            uint64_t key = ((uint64_t)pid << 32) | (uint32_t)ctx->ret;
+            bpf_map_update_elem(&fd_track, &key, fe, BPF_ANY);
+        }
     }
 
 cleanup:
