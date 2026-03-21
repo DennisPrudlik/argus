@@ -18,6 +18,8 @@ typedef struct {
     char     output_path[256];      /* "" = stdout; else write events to file  */
     char     rules_path[256];       /* "" = no rules; else load rules JSON     */
     char     forward_addr[256];     /* "" = off; else "host:port" to forward   */
+    int      forward_tls;           /* 1 = TLS with cert verification           */
+    int      forward_tls_noverify;  /* 1 = TLS without cert verification        */
     char     baseline_path[256];    /* "" = off; else load profile for anomaly */
     char     baseline_out[256];     /* "" = off; else write learnt profile     */
     int      baseline_learn_secs;   /* 0 = detect; >0 = learn for N seconds   */

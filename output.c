@@ -17,6 +17,54 @@ static FILE        *g_out    = NULL;   /* NULL = use stdout */
 
 #define OUT (g_out ? g_out : stdout)
 
+/* ── uid → username enrichment ──────────────────────────────────────────── */
+/*
+ * Lazily loads /etc/passwd on first call.  Uses a 512-slot hash table;
+ * first entry per slot wins (collisions are silently ignored — enrichment
+ * is best-effort, not authoritative).
+ */
+
+#define UID_CACHE_SZ 512
+
+typedef struct { uint32_t uid; char name[32]; int used; } uid_entry_t;
+
+static uid_entry_t g_uid_cache[UID_CACHE_SZ];
+static int         g_uid_loaded = 0;
+
+static void load_uid_cache(void)
+{
+    g_uid_loaded = 1;
+    FILE *f = fopen("/etc/passwd", "r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        /* name : x : uid : gid : ... */
+        char *name = line;
+        char *p = strchr(line, ':'); if (!p) continue; *p++ = '\0';
+        p = strchr(p, ':');          if (!p) continue; p++;   /* skip 'x' */
+        char *uid_s = p;
+        p = strchr(p, ':');          if (!p) continue; *p = '\0';
+        uint32_t uid = (uint32_t)atoi(uid_s);
+        unsigned slot = uid % UID_CACHE_SZ;
+        if (!g_uid_cache[slot].used) {
+            g_uid_cache[slot].uid  = uid;
+            g_uid_cache[slot].used = 1;
+            strncpy(g_uid_cache[slot].name, name,
+                    sizeof(g_uid_cache[slot].name) - 1);
+        }
+    }
+    fclose(f);
+}
+
+static const char *uid_name(uint32_t uid)
+{
+    if (!g_uid_loaded) load_uid_cache();
+    unsigned slot = uid % UID_CACHE_SZ;
+    if (g_uid_cache[slot].used && g_uid_cache[slot].uid == uid)
+        return g_uid_cache[slot].name;
+    return NULL;
+}
+
 void output_init(output_fmt_t fmt, const filter_t *filter)
 {
     g_fmt = fmt;
@@ -128,11 +176,11 @@ void print_header(const char *backend)
         g_filter.exclude_count)
         fputc('\n', OUT);
 
-    fprintf(OUT, "\n%-5s  %-6s  %-6s  %-4s  %-4s  %-16s  %-24s  %-32s  %s\n",
-           "TYPE", "PID", "PPID", "UID", "GID", "COMM",
+    fprintf(OUT, "\n%-5s  %-6s  %-6s  %-10s  %-4s  %-16s  %-24s  %-32s  %s\n",
+           "TYPE", "PID", "PPID", "USER", "GID", "COMM",
            "CGROUP", "LINEAGE", "DETAIL");
-    fprintf(OUT, "%-5s  %-6s  %-6s  %-4s  %-4s  %-16s  %-24s  %-32s  %s\n",
-           "-----", "------", "------", "----", "----",
+    fprintf(OUT, "%-5s  %-6s  %-6s  %-10s  %-4s  %-16s  %-24s  %-32s  %s\n",
+           "-----", "------", "------", "----------", "----",
            "----------------", "------------------------",
            "--------------------------------", "------");
 }
@@ -151,8 +199,14 @@ static void text_event(const event_t *e)
     };
     const char *tname = (e->type < EVENT_TYPE_MAX) ? type_names[e->type] : "?";
 
-    fprintf(OUT, "%-5s  %-6d  %-6d  %-4u  %-4u  %-16s  %-24s  %-32s  ",
-           tname, e->pid, e->ppid, e->uid, e->gid, e->comm,
+    /* Show username when available, fall back to raw UID */
+    const char *uname = uid_name(e->uid);
+    char uid_buf[20];
+    if (uname) snprintf(uid_buf, sizeof(uid_buf), "%.10s", uname);
+    else        snprintf(uid_buf, sizeof(uid_buf), "%u", e->uid);
+
+    fprintf(OUT, "%-5s  %-6d  %-6d  %-10s  %-4u  %-16s  %-24s  %-32s  ",
+           tname, e->pid, e->ppid, uid_buf, e->gid, e->comm,
            e->cgroup[0] ? e->cgroup : "-", chain);
 
     switch (e->type) {
@@ -255,9 +309,11 @@ static void json_event(const event_t *e)
     const char *ts = (e->type < EVENT_TYPE_MAX) ? type_str[e->type] : "UNKNOWN";
     fprintf(OUT, "{\"type\":\"%s\","
            "\"pid\":%d,\"ppid\":%d,"
-           "\"uid\":%u,\"gid\":%u,"
-           "\"comm\":",
+           "\"uid\":%u,\"gid\":%u,",
            ts, e->pid, e->ppid, e->uid, e->gid);
+    const char *uname = uid_name(e->uid);
+    if (uname) { fprintf(OUT, "\"user\":"); json_str(uname); fprintf(OUT, ","); }
+    fprintf(OUT, "\"comm\":");
     json_str(e->comm);
     fprintf(OUT, ",\"cgroup\":");
     json_str(e->cgroup);

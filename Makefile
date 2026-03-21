@@ -8,6 +8,12 @@ BPF_CFLAGS := -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) \
               -I/usr/include/$(shell uname -m)-linux-gnu
 CFLAGS     := -g -Wall -I.
 
+# Optional OpenSSL — detected automatically via pkg-config; used for TLS forwarding
+OPENSSL_LIBS := $(shell pkg-config --libs openssl 2>/dev/null)
+ifneq ($(OPENSSL_LIBS),)
+CFLAGS += -DHAVE_OPENSSL $(shell pkg-config --cflags openssl 2>/dev/null)
+endif
+
 PREFIX      ?= /usr/local
 BINDIR       = $(DESTDIR)$(PREFIX)/bin
 UNITDIR      = $(DESTDIR)/etc/systemd/system
@@ -38,7 +44,7 @@ argus: argus.c output.c lineage.c config.c rules.c forward.c dns.c baseline.c \
        output.h lineage.h config.h rules.h forward.h dns.h baseline.h \
        argus.skel.h argus.h
 	$(CC) $(CFLAGS) -o $@ argus.c output.c lineage.c config.c rules.c \
-	    forward.c dns.c baseline.c -lbpf -lelf -lz
+	    forward.c dns.c baseline.c -lbpf -lelf -lz $(OPENSSL_LIBS)
 
 # ── unit tests (no BPF, no root) ──────────────────────────────────────────────
 
@@ -58,7 +64,7 @@ tests/test_rules: tests/test_rules.c rules.c $(COMMON_SRCS) \
 
 tests/test_forward: tests/test_forward.c forward.c $(COMMON_SRCS) \
                     forward.h $(COMMON_HDRS)
-	$(CC) $(CFLAGS) -o $@ tests/test_forward.c forward.c $(COMMON_SRCS)
+	$(CC) $(CFLAGS) -o $@ tests/test_forward.c forward.c $(COMMON_SRCS) $(OPENSSL_LIBS)
 
 test-unit: tests/test_lineage tests/test_output tests/test_rules tests/test_forward
 	@echo "── lineage ──────────────────────────────────"
@@ -90,7 +96,7 @@ tests/test_rules_asan: tests/test_rules.c rules.c $(COMMON_SRCS) \
 
 tests/test_forward_asan: tests/test_forward.c forward.c $(COMMON_SRCS) \
                          forward.h $(COMMON_HDRS)
-	$(CC) $(CFLAGS) $(ASAN_FLAGS) -o $@ tests/test_forward.c forward.c $(COMMON_SRCS)
+	$(CC) $(CFLAGS) $(ASAN_FLAGS) -o $@ tests/test_forward.c forward.c $(COMMON_SRCS) $(OPENSSL_LIBS)
 
 test-asan: tests/test_lineage_asan tests/test_output_asan tests/test_rules_asan tests/test_forward_asan
 	@echo "── lineage (ASAN) ───────────────────────────────"

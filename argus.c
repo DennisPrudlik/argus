@@ -89,6 +89,8 @@ static void usage(const char *prog)
         "  --syslog                       Emit events to syslog(LOG_DAEMON)\n"
         "  --rules           <path>       Load alert rules from JSON file\n"
         "  --forward         <host:port>  Stream JSON events to remote host over TCP\n"
+        "  --forward-tls                  Enable TLS for --forward (verify server cert)\n"
+        "  --forward-tls-noverify         Enable TLS for --forward (skip cert verify)\n"
         "  --baseline        <path>       Detect anomalies using learnt profile\n"
         "  --baseline-learn  <secs>       Learn a baseline for N seconds\n"
         "  --baseline-out    <path>       Write learnt baseline profile to file\n"
@@ -165,8 +167,10 @@ static void configure_programs(struct argus_bpf *skel, int event_mask,
     if (!follow_pid)
         bpf_program__set_autoload(skel->progs.handle_process_fork, false);
     if (!(event_mask & TRACE_EXEC)) {
-        bpf_program__set_autoload(skel->progs.handle_execve_enter,  false);
-        bpf_program__set_autoload(skel->progs.handle_execve_exit,   false);
+        bpf_program__set_autoload(skel->progs.handle_execve_enter,    false);
+        bpf_program__set_autoload(skel->progs.handle_execve_exit,     false);
+        bpf_program__set_autoload(skel->progs.handle_execveat_enter,  false);
+        bpf_program__set_autoload(skel->progs.handle_execveat_exit,   false);
     }
     if (!(event_mask & TRACE_OPEN)) {
         bpf_program__set_autoload(skel->progs.handle_openat_enter,  false);
@@ -268,7 +272,9 @@ int main(int argc, char **argv)
         {"output",          required_argument, 0, 'o'},
         {"syslog",          no_argument,       0, 'S'},
         {"rules",           required_argument, 0, 'a'},
-        {"forward",         required_argument, 0, 'f'},
+        {"forward",             required_argument, 0, 'f'},
+        {"forward-tls",         no_argument,       0, 't'},
+        {"forward-tls-noverify",no_argument,       0, 'T'},
         {"baseline",        required_argument, 0, 'b'},
         {"baseline-learn",  required_argument, 0, 'L'},
         {"baseline-out",    required_argument, 0, 'B'},
@@ -282,7 +288,7 @@ int main(int argc, char **argv)
 
     int config_check = 0;
     int opt;
-    while ((opt = getopt_long(argc, argv, "C:p:F:c:P:x:e:r:s:R:o:Sa:f:b:L:B:njKVh",
+    while ((opt = getopt_long(argc, argv, "C:p:F:c:P:x:e:r:s:R:o:Sa:f:tTb:L:B:njKVh",
                               long_opts, NULL)) != -1) {
         switch (opt) {
         case 'C':
@@ -317,6 +323,8 @@ int main(int argc, char **argv)
         case 'S': cfg.use_syslog            = 1;                                         break;
         case 'a': strncpy(cfg.rules_path,    optarg, sizeof(cfg.rules_path)-1);         break;
         case 'f': strncpy(cfg.forward_addr,  optarg, sizeof(cfg.forward_addr)-1);       break;
+        case 't': cfg.forward_tls          = 1;                                          break;
+        case 'T': cfg.forward_tls_noverify = 1;                                          break;
         case 'b': strncpy(cfg.baseline_path, optarg, sizeof(cfg.baseline_path)-1);      break;
         case 'L': cfg.baseline_learn_secs   = atoi(optarg);                             break;
         case 'B': strncpy(cfg.baseline_out,  optarg, sizeof(cfg.baseline_out)-1);       break;
@@ -346,6 +354,12 @@ int main(int argc, char **argv)
         printf("  syslog              : %s\n",  cfg.use_syslog      ? "yes"            : "no");
         printf("  rules               : %s\n",  cfg.rules_path[0]   ? cfg.rules_path   : "(none)");
         printf("  forward             : %s\n",  cfg.forward_addr[0] ? cfg.forward_addr : "(off)");
+        if (cfg.forward_addr[0]) {
+            const char *tls_mode = cfg.forward_tls_noverify ? "tls-noverify"
+                                 : cfg.forward_tls          ? "tls"
+                                 : "plain";
+            printf("  forward_tls         : %s\n", tls_mode);
+        }
         printf("  follow_pid          : %d\n",  cfg.follow_pid);
         printf("  baseline            : %s\n",  cfg.baseline_path[0]     ? cfg.baseline_path     : "(off)");
         printf("  baseline_learn_secs : %d\n",  cfg.baseline_learn_secs);
@@ -400,7 +414,12 @@ int main(int argc, char **argv)
                     cfg.forward_addr);
             return 1;
         }
-        if (forward_init(fwd_host, fwd_port) == 0) {
+        int fwd_flags = 0;
+        if (cfg.forward_tls_noverify)
+            fwd_flags = FORWARD_FLAG_TLS_NOVERIFY;
+        else if (cfg.forward_tls)
+            fwd_flags = FORWARD_FLAG_TLS;
+        if (forward_add(fwd_host, fwd_port, fwd_flags) == 0) {
             forwarding    = 1;
             g_forwarding  = 1;
         }

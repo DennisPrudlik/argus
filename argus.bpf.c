@@ -223,6 +223,78 @@ int handle_execve_enter(struct trace_event_raw_sys_enter *ctx)
     return 0;
 }
 
+/* ── execveat enter/exit — same pattern, different arg offsets ── */
+
+SEC("tracepoint/syscalls/sys_enter_execveat")
+int handle_execveat_enter(struct trace_event_raw_sys_enter *ctx)
+{
+    uint32_t zero = 0;
+    struct exec_start *es = bpf_map_lookup_elem(&exec_scratch, &zero);
+    if (!es)
+        return 0;
+
+    __builtin_memset(es, 0, sizeof(*es));
+    es->ts = bpf_ktime_get_ns();
+
+    /* execveat: args[0]=dirfd, args[1]=pathname, args[2]=argv */
+    bpf_probe_read_user_str(es->filename, sizeof(es->filename),
+                            (const char *)ctx->args[1]);
+
+    const char *const *argv = (const char *const *)ctx->args[2];
+
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        const char *argp = NULL;
+        if (bpf_probe_read_user(&argp, sizeof(argp), &argv[i + 1]) || !argp)
+            break;
+        bpf_probe_read_user_str(es->args + i * 32, 31, argp);
+        if (i < 7)
+            es->args[i * 32 + 31] = ' ';
+    }
+
+    uint32_t pid = bpf_get_current_pid_tgid() >> 32;
+    if (should_drop_pid(pid))
+        return 0;
+    bpf_map_update_elem(&execs, &pid, es, BPF_ANY);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_execveat")
+int handle_execveat_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    /* Identical to execve exit — shares the same execs scratch map */
+    uint32_t pid = bpf_get_current_pid_tgid() >> 32;
+
+    struct exec_start *es = bpf_map_lookup_elem(&execs, &pid);
+    if (!es)
+        goto cleanup;
+
+    char comm[16] = {};
+    bpf_get_current_comm(comm, sizeof(comm));
+    if (should_filter_out(pid, comm))
+        goto cleanup;
+
+    event_t *e = bpf_ringbuf_reserve(&rb, sizeof(event_t), 0);
+    if (!e) {
+        note_drop();
+        goto cleanup;
+    }
+
+    e->type        = EVENT_EXEC;
+    e->duration_ns = bpf_ktime_get_ns() - es->ts;
+    e->success     = (ctx->ret == 0);
+    fill_common(e, pid, comm);
+
+    __builtin_memcpy(e->filename, es->filename, sizeof(e->filename));
+    __builtin_memcpy(e->args,     es->args,     sizeof(e->args));
+
+    bpf_ringbuf_submit(e, 0);
+
+cleanup:
+    bpf_map_delete_elem(&execs, &pid);
+    return 0;
+}
+
 SEC("tracepoint/syscalls/sys_exit_execve")
 int handle_execve_exit(struct trace_event_raw_sys_exit *ctx)
 {

@@ -178,6 +178,12 @@ int cfg_load(const char *path, argus_cfg_t *cfg)
         }
         else if (strcmp(key, "forward") == 0)
             p = parse_str(p, cfg->forward_addr, sizeof(cfg->forward_addr));
+        else if (strcmp(key, "forward_tls") == 0) {
+            int v = 0; p = parse_bool(p, &v); cfg->forward_tls = v;
+        }
+        else if (strcmp(key, "forward_tls_noverify") == 0) {
+            int v = 0; p = parse_bool(p, &v); cfg->forward_tls_noverify = v;
+        }
         else if (strcmp(key, "syslog") == 0) {
             int v = 0;
             p = parse_bool(p, &v);

@@ -330,15 +330,20 @@ echo "Test 10: --rate-limit drops"
 start_argus --rate-limit 3 --comm cat --events OPEN
 
 # Generate many OPEN events from cat in rapid succession
-for i in $(seq 1 30); do
+# Each cat invocation opens 3-4 files; 50 invocations ≈ 150-200 OPEN events without rate limiting.
+# With rate-limit 3 per second we expect ≤ ~15 events over ~0.5 s window.
+for i in $(seq 1 50); do
     cat /etc/hostname >/dev/null 2>&1
 done
 sleep 0.4
 stop_argus
 
-DROP_COUNT=$(count_drops)
-check "--rate-limit: drops occurred under high event rate" \
-    "$([ "$DROP_COUNT" -gt 0 ] && echo 0 || echo 1)"
+# Rate-limit drops at the BPF layer are silently discarded (not ring-buffer overflow),
+# so no DROP event is emitted. Verify instead that we received far fewer events than
+# generated (rate limiting is working).
+OPEN_COUNT=$(count_events "type=OPEN")
+check "--rate-limit: fewer events received than generated (rate limited)" \
+    "$([ "$OPEN_COUNT" -lt 50 ] && echo 0 || echo 1)"
 rm -f "$OUTFILE"
 
 # ── test 11: --forward E2E ────────────────────────────────────────────────────
@@ -428,7 +433,6 @@ echo ""
 echo "Test 12: --rules alert on matching event"
 
 RULES_FILE=$(mktemp /tmp/argus_rules_XXXXXX.json)
-RULES_ERR=$(mktemp /tmp/argus_rules_err_XXXXXX)
 TMP_CHMOD2=$(mktemp /tmp/argus_chmod2_XXXXXX)
 
 cat >"$RULES_FILE" <<'JSON'
@@ -443,7 +447,7 @@ cat >"$RULES_FILE" <<'JSON'
 JSON
 
 OUTFILE=$(mktemp /tmp/argus_test_XXXXXX.json)
-"$ARGUS" --rules "$RULES_FILE" --events CHMOD --json >"$OUTFILE" 2>"$RULES_ERR" &
+"$ARGUS" --rules "$RULES_FILE" --events CHMOD --json >"$OUTFILE" 2>/dev/null &
 ARGUS_PID=$!
 sleep 0.5
 
@@ -453,10 +457,11 @@ sleep 0.4
 kill "$ARGUS_PID" 2>/dev/null || true
 wait "$ARGUS_PID" 2>/dev/null || true
 
-RULE_HITS=$(grep -c "integration-chmod-rule\|chmod on" "$RULES_ERR" 2>/dev/null || echo 0)
+# In JSON mode, ALERT events are emitted as {"type":"ALERT",...} lines in stdout.
+RULE_HITS=$(grep -c '"integration-chmod-rule"' "$OUTFILE" 2>/dev/null || true)
 check "--rules: alert fired for matching CHMOD event" \
-    "$([ "$RULE_HITS" -gt 0 ] && echo 0 || echo 1)"
-rm -f "$OUTFILE" "$RULES_ERR" "$RULES_FILE" "$TMP_CHMOD2"
+    "$([ "${RULE_HITS:-0}" -gt 0 ] && echo 0 || echo 1)"
+rm -f "$OUTFILE" "$RULES_FILE" "$TMP_CHMOD2"
 
 # ── test 13: --output file persistence ────────────────────────────────────────
 

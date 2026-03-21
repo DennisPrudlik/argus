@@ -6,43 +6,80 @@ on:
   pull_request:
     branches: [ main ]
 
+# ── Unit tests — no BPF, no root, runs on every push ──────────────────────────
 jobs:
-  build-and-test:
+  unit-tests:
+    name: Unit tests (${{ matrix.os }})
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            clang llvm \
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            gcc clang llvm \
             libbpf-dev libelf-dev zlib1g-dev \
-            linux-tools-common linux-tools-generic
+            libssl-dev \
+            python3
 
-      - name: Symlink bpftool
+      - name: Unit tests (normal)
+        run: make test
+
+      - name: Unit tests (ASAN / UBSan)
+        run: make test-asan
+
+# ── Integration tests — needs BTF-enabled kernel + root ───────────────────────
+  integration-tests:
+    name: Integration tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build + BPF dependencies
         run: |
-          BPFTOOL=$(find /usr/lib/linux-tools -name bpftool 2>/dev/null | head -1)
-          if [ -n "$BPFTOOL" ]; then
-            sudo ln -sf "$BPFTOOL" /usr/local/bin/bpftool
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            gcc clang llvm \
+            libbpf-dev libelf-dev zlib1g-dev \
+            libssl-dev \
+            linux-tools-common linux-tools-generic \
+            python3 strace
+
+      - name: Locate bpftool
+        run: |
+          # Try version-specific package first (most reliable on GH Actions)
+          sudo apt-get install -y --no-install-recommends \
+            linux-tools-$(uname -r) 2>/dev/null || true
+
+          # Find the newest bpftool binary under /usr/lib/linux-tools
+          BPFTOOL=$(find /usr/lib/linux-tools /usr/sbin /usr/bin /usr/local/bin \
+                         -name bpftool 2>/dev/null | sort -t- -k1,1V | tail -1)
+          if [ -z "$BPFTOOL" ]; then
+            echo "ERROR: bpftool not found" && exit 1
           fi
+          sudo ln -sf "$BPFTOOL" /usr/local/bin/bpftool
           bpftool --version
 
       - name: Verify BTF support
-        run: ls /sys/kernel/btf/vmlinux
+        run: |
+          ls /sys/kernel/btf/vmlinux || \
+            (echo "BTF not available on this kernel — skipping" && exit 0)
 
-      - name: Build
+      - name: Build argus
         run: make
-
-      - name: Unit tests
-        run: make test
-
-      - name: Unit tests (ASAN/UBSan)
-        run: make test-asan
 
       - name: Integration tests
         run: make test-integration
