@@ -129,7 +129,7 @@ tests/test_output_asan: tests/test_output.c $(COMMON_SRCS) $(COMMON_HDRS)
 
 tests/test_rules_asan: tests/test_rules.c rules.c $(COMMON_SRCS) \
                        rules.h $(COMMON_HDRS)
-	$(CC) $(CFLAGS) $(ASAN_FLAGS) -o $@ tests/test_rules.c rules.c $(COMMON_SRCS) -lpthread
+	$(CC) $(CFLAGS) $(ASAN_FLAGS) -o $@ tests/test_rules.c rules.c $(COMMON_SRCS) -lpthread -lbpf
 
 tests/test_forward_asan: tests/test_forward.c forward.c $(COMMON_SRCS) \
                          forward.h $(COMMON_HDRS)

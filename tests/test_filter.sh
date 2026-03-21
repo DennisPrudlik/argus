@@ -40,7 +40,7 @@ start_argus() {
     OUTFILE=$(mktemp /tmp/argus_test_XXXXXX.json)
     "$ARGUS" "$@" --json >"$OUTFILE" 2>/dev/null &
     ARGUS_PID=$!
-    sleep 0.4   # give BPF programs time to attach
+    sleep 1.0   # give BPF programs time to attach (more handlers = longer attach)
 }
 
 stop_argus() {
