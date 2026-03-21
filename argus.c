@@ -14,12 +14,17 @@
 #include "output.h"
 #include "lineage.h"
 #include "config.h"
+#include "rules.h"
+#include "forward.h"
+#include "baseline.h"
+#include "dns.h"
 
 static volatile int running       = 1;
 static volatile int reload_config = 0;
 static uint64_t     last_drops    = 0;
+static int          g_forwarding  = 0;   /* set after forward_init succeeds */
 
-static void sig_handler(int sig)  { (void)sig; running = 0; }
+static void sig_handler(int sig)    { (void)sig; running = 0; }
 static void sighup_handler(int sig) { (void)sig; reload_config = 1; }
 
 /* ── drop accounting ────────────────────────────────────────────────────── */
@@ -69,21 +74,29 @@ static void usage(const char *prog)
         "Usage: %s [OPTIONS]\n"
         "\n"
         "Options:\n"
-        "  --config      <path>  Config file (default: ~/.config/argus/config.json)\n"
-        "  --pid         <pid>   Only trace this PID (kernel-enforced)\n"
-        "  --comm        <name>  Only trace this process name (kernel-enforced)\n"
-        "  --path        <str>   Only show events whose path contains <str>\n"
-        "  --exclude     <pfx>   Exclude OPEN events whose path starts with <pfx>\n"
-        "  --events      <list>  Comma-separated types: EXEC,OPEN,EXIT,CONNECT,\n"
-        "                         UNLINK,RENAME,CHMOD,BIND,PTRACE\n"
-        "  --ringbuf     <kb>    Ring buffer size in KB (default: 256)\n"
-        "  --summary     <secs>  Rolling summary every N seconds\n"
-        "  --rate-limit  <n>    Drop events after N per second per comm (0=off)\n"
-        "  --no-drop-privs       Stay root after attach (not recommended)\n"
-        "  --json                Newline-delimited JSON output\n"
-        "  --config-check        Validate config file(s) and print active settings, then exit\n"
-        "  --version             Print version and exit\n"
-        "  --help                Show this message\n",
+        "  --config          <path>       Config file (default: ~/.config/argus/config.json)\n"
+        "  --pid             <pid>        Only trace this PID (kernel-enforced)\n"
+        "  --follow          <pid>        Trace PID and all descendant processes\n"
+        "  --comm            <name>       Only trace this process name (kernel-enforced)\n"
+        "  --path            <str>        Only show events whose path contains <str>\n"
+        "  --exclude         <pfx>        Exclude file events whose path starts with <pfx>\n"
+        "  --events          <list>       Comma-separated types: EXEC,OPEN,EXIT,CONNECT,\n"
+        "                                   UNLINK,RENAME,CHMOD,BIND,PTRACE\n"
+        "  --ringbuf         <kb>         Ring buffer size in KB (default: 256)\n"
+        "  --summary         <secs>       Rolling summary every N seconds\n"
+        "  --rate-limit      <n>          Drop events after N per second per comm (0=off)\n"
+        "  --output          <path>       Write events to file instead of stdout\n"
+        "  --syslog                       Emit events to syslog(LOG_DAEMON)\n"
+        "  --rules           <path>       Load alert rules from JSON file\n"
+        "  --forward         <host:port>  Stream JSON events to remote host over TCP\n"
+        "  --baseline        <path>       Detect anomalies using learnt profile\n"
+        "  --baseline-learn  <secs>       Learn a baseline for N seconds\n"
+        "  --baseline-out    <path>       Write learnt baseline profile to file\n"
+        "  --no-drop-privs               Stay root after attach (not recommended)\n"
+        "  --json                         Newline-delimited JSON output\n"
+        "  --config-check                 Validate config file(s) and print settings, then exit\n"
+        "  --version                      Print version and exit\n"
+        "  --help                         Show this message\n",
         prog);
 }
 
@@ -113,7 +126,7 @@ static int parse_event_list(const char *s)
 /* ── BPF setup ──────────────────────────────────────────────────────────── */
 
 static void setup_bpf_filters(struct argus_bpf *skel, const filter_t *f,
-                               uint32_t rate_limit_per_comm)
+                               uint32_t rate_limit_per_comm, int follow_pid)
 {
     argus_config_t cfg = {};
     uint32_t zero = 0;
@@ -133,14 +146,24 @@ static void setup_bpf_filters(struct argus_bpf *skel, const filter_t *f,
                             key, &val, BPF_ANY);
         cfg.filter_comm_active = 1;
     }
+    if (follow_pid > 0) {
+        uint32_t pid = (uint32_t)follow_pid;
+        uint8_t  val = 1;
+        bpf_map_update_elem(bpf_map__fd(skel->maps.follow_pids),
+                            &pid, &val, BPF_ANY);
+        cfg.filter_follow_active = 1;
+    }
     cfg.rate_limit_per_comm = rate_limit_per_comm;
-    /* always write config_map — even with no filters, rate_limit may be set */
     bpf_map_update_elem(bpf_map__fd(skel->maps.config_map),
                         &zero, &cfg, BPF_ANY);
 }
 
-static void configure_programs(struct argus_bpf *skel, int event_mask)
+static void configure_programs(struct argus_bpf *skel, int event_mask,
+                               int follow_pid)
 {
+    /* Fork handler is only useful when --follow is active */
+    if (!follow_pid)
+        bpf_program__set_autoload(skel->progs.handle_process_fork, false);
     if (!(event_mask & TRACE_EXEC)) {
         bpf_program__set_autoload(skel->progs.handle_execve_enter,  false);
         bpf_program__set_autoload(skel->progs.handle_execve_exit,   false);
@@ -184,8 +207,18 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
     (void)ctx; (void)data_sz;
     const event_t *e = data;
 
-    if (event_matches(e))
+    if (event_matches(e)) {
         print_event(e);
+        if (g_forwarding)
+            forward_event(e);
+    }
+
+    /* Run alert rules and baseline check regardless of output filter */
+    rules_check(e);
+    if (baseline_learning())
+        baseline_learn(e);
+    else
+        baseline_check(e);
 
     /* Update lineage regardless of filter so the tree stays consistent */
     if (e->type == EVENT_EXEC)
@@ -202,7 +235,9 @@ int main(int argc, char **argv)
 {
     argus_cfg_t  cfg;
     output_fmt_t fmt          = OUTPUT_TEXT;
-    int          no_drop_privs = 0;
+    int          no_drop_privs  = 0;
+    int          forwarding     = 0;
+    FILE        *output_file    = NULL;
 
     cfg_defaults(&cfg);
 
@@ -220,35 +255,44 @@ int main(int argc, char **argv)
     }
 
     static const struct option long_opts[] = {
-        {"config",        required_argument, 0, 'C'},
-        {"pid",           required_argument, 0, 'p'},
-        {"comm",          required_argument, 0, 'c'},
-        {"path",          required_argument, 0, 'P'},
-        {"exclude",       required_argument, 0, 'x'},
-        {"events",        required_argument, 0, 'e'},
-        {"ringbuf",       required_argument, 0, 'r'},
-        {"summary",       required_argument, 0, 's'},
-        {"rate-limit",    required_argument, 0, 'R'},
-        {"no-drop-privs", no_argument,       0, 'n'},
-        {"json",          no_argument,       0, 'j'},
-        {"config-check",  no_argument,       0, 'K'},
-        {"version",       no_argument,       0, 'V'},
-        {"help",          no_argument,       0, 'h'},
+        {"config",          required_argument, 0, 'C'},
+        {"pid",             required_argument, 0, 'p'},
+        {"follow",          required_argument, 0, 'F'},
+        {"comm",            required_argument, 0, 'c'},
+        {"path",            required_argument, 0, 'P'},
+        {"exclude",         required_argument, 0, 'x'},
+        {"events",          required_argument, 0, 'e'},
+        {"ringbuf",         required_argument, 0, 'r'},
+        {"summary",         required_argument, 0, 's'},
+        {"rate-limit",      required_argument, 0, 'R'},
+        {"output",          required_argument, 0, 'o'},
+        {"syslog",          no_argument,       0, 'S'},
+        {"rules",           required_argument, 0, 'a'},
+        {"forward",         required_argument, 0, 'f'},
+        {"baseline",        required_argument, 0, 'b'},
+        {"baseline-learn",  required_argument, 0, 'L'},
+        {"baseline-out",    required_argument, 0, 'B'},
+        {"no-drop-privs",   no_argument,       0, 'n'},
+        {"json",            no_argument,       0, 'j'},
+        {"config-check",    no_argument,       0, 'K'},
+        {"version",         no_argument,       0, 'V'},
+        {"help",            no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int config_check = 0;
     int opt;
-    while ((opt = getopt_long(argc, argv, "C:p:c:P:x:e:r:s:R:njKVh",
+    while ((opt = getopt_long(argc, argv, "C:p:F:c:P:x:e:r:s:R:o:Sa:f:b:L:B:njKVh",
                               long_opts, NULL)) != -1) {
         switch (opt) {
         case 'C':
             if (cfg_load(optarg, &cfg) != 0)
                 fprintf(stderr, "warning: could not load %s\n", optarg);
             break;
-        case 'p': cfg.filter.pid = atoi(optarg);                                  break;
-        case 'c': strncpy(cfg.filter.comm, optarg, sizeof(cfg.filter.comm)-1);    break;
-        case 'P': strncpy(cfg.filter.path, optarg, sizeof(cfg.filter.path)-1);    break;
+        case 'p': cfg.filter.pid = atoi(optarg);                                        break;
+        case 'F': cfg.follow_pid = atoi(optarg);                                        break;
+        case 'c': strncpy(cfg.filter.comm, optarg, sizeof(cfg.filter.comm)-1);          break;
+        case 'P': strncpy(cfg.filter.path, optarg, sizeof(cfg.filter.path)-1);          break;
         case 'x':
             if (cfg.filter.exclude_count < 8)
                 strncpy(cfg.filter.excludes[cfg.filter.exclude_count++],
@@ -257,7 +301,7 @@ int main(int argc, char **argv)
                 fprintf(stderr, "warning: --exclude limit (8) reached, "
                                 "ignoring '%s'\n", optarg);
             break;
-        case 'e': cfg.filter.event_mask = parse_event_list(optarg);               break;
+        case 'e': cfg.filter.event_mask = parse_event_list(optarg);                     break;
         case 'r': {
             int kb = atoi(optarg);
             if (kb < 4 || kb > 65536) {
@@ -267,16 +311,27 @@ int main(int argc, char **argv)
             cfg.ring_buffer_kb = kb;
             break;
         }
-        case 's': cfg.summary_interval      = atoi(optarg);                       break;
-        case 'R': cfg.rate_limit_per_comm  = (uint32_t)atoi(optarg);             break;
-        case 'n': no_drop_privs            = 1;                                   break;
-        case 'j': fmt                   = OUTPUT_JSON;                             break;
-        case 'K': config_check          = 1;                                       break;
+        case 's': cfg.summary_interval      = atoi(optarg);                             break;
+        case 'R': cfg.rate_limit_per_comm   = (uint32_t)atoi(optarg);                  break;
+        case 'o': strncpy(cfg.output_path,   optarg, sizeof(cfg.output_path)-1);        break;
+        case 'S': cfg.use_syslog            = 1;                                         break;
+        case 'a': strncpy(cfg.rules_path,    optarg, sizeof(cfg.rules_path)-1);         break;
+        case 'f': strncpy(cfg.forward_addr,  optarg, sizeof(cfg.forward_addr)-1);       break;
+        case 'b': strncpy(cfg.baseline_path, optarg, sizeof(cfg.baseline_path)-1);      break;
+        case 'L': cfg.baseline_learn_secs   = atoi(optarg);                             break;
+        case 'B': strncpy(cfg.baseline_out,  optarg, sizeof(cfg.baseline_out)-1);       break;
+        case 'n': no_drop_privs             = 1;                                         break;
+        case 'j': fmt                       = OUTPUT_JSON;                               break;
+        case 'K': config_check              = 1;                                         break;
         case 'V': printf("argus %s\n", ARGUS_VERSION); return 0;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 1;
         }
     }
+
+    /* --syslog overrides --json and --output */
+    if (cfg.use_syslog)
+        fmt = OUTPUT_SYSLOG;
 
     if (config_check) {
         static const char *type_names[] = {
@@ -287,6 +342,14 @@ int main(int argc, char **argv)
         printf("  ring_buffer_kb      : %d\n",  cfg.ring_buffer_kb);
         printf("  summary_interval    : %d\n",  cfg.summary_interval);
         printf("  rate_limit_per_comm : %u\n",  cfg.rate_limit_per_comm);
+        printf("  output_path         : %s\n",  cfg.output_path[0]  ? cfg.output_path  : "(stdout)");
+        printf("  syslog              : %s\n",  cfg.use_syslog      ? "yes"            : "no");
+        printf("  rules               : %s\n",  cfg.rules_path[0]   ? cfg.rules_path   : "(none)");
+        printf("  forward             : %s\n",  cfg.forward_addr[0] ? cfg.forward_addr : "(off)");
+        printf("  follow_pid          : %d\n",  cfg.follow_pid);
+        printf("  baseline            : %s\n",  cfg.baseline_path[0]     ? cfg.baseline_path     : "(off)");
+        printf("  baseline_learn_secs : %d\n",  cfg.baseline_learn_secs);
+        printf("  baseline_out        : %s\n",  cfg.baseline_out[0]      ? cfg.baseline_out      : "(none)");
         printf("  filter.pid          : %d\n",  cfg.filter.pid);
         printf("  filter.comm         : %s\n",  cfg.filter.comm[0] ? cfg.filter.comm : "(none)");
         printf("  filter.path         : %s\n",  cfg.filter.path[0] ? cfg.filter.path : "(none)");
@@ -310,9 +373,63 @@ int main(int argc, char **argv)
     if (cfg.filter.event_mask == 0)
         cfg.filter.event_mask = TRACE_ALL;
 
+    /* Open output file before dropping privileges */
+    if (!cfg.use_syslog && cfg.output_path[0]) {
+        output_file = fopen(cfg.output_path, "a");
+        if (!output_file) {
+            perror("error: could not open output file");
+            return 1;
+        }
+    }
+
     output_init(fmt, &cfg.filter);
+    if (output_file)
+        output_set_file(output_file);
     if (cfg.summary_interval > 0)
         output_set_summary(cfg.summary_interval);
+
+    /* Initialise TCP forwarding (before privilege drop — needs getaddrinfo) */
+    if (cfg.forward_addr[0]) {
+        char fwd_host[256] = {};
+        int  fwd_port = 0;
+        if (forward_parse_addr(cfg.forward_addr, fwd_host, sizeof(fwd_host),
+                               &fwd_port) != 0) {
+            fprintf(stderr,
+                    "error: --forward: invalid address '%s' "
+                    "(expected host:port or [ipv6]:port)\n",
+                    cfg.forward_addr);
+            return 1;
+        }
+        if (forward_init(fwd_host, fwd_port) == 0) {
+            forwarding    = 1;
+            g_forwarding  = 1;
+        }
+    }
+
+    /* Load alert rules */
+    if (cfg.rules_path[0]) {
+        int n = rules_load(cfg.rules_path);
+        if (n > 0)
+            fprintf(stderr, "info: loaded %d alert rule(s) from %s\n",
+                    n, cfg.rules_path);
+    }
+
+    /* Initialise baseline (learning or detection mode) */
+    if (cfg.baseline_learn_secs > 0) {
+        const char *out = cfg.baseline_out[0] ? cfg.baseline_out : "baseline.json";
+        if (baseline_learn_init(out, cfg.baseline_learn_secs) == 0)
+            fprintf(stderr,
+                    "info: baseline learning for %d seconds → %s\n",
+                    cfg.baseline_learn_secs, out);
+    } else if (cfg.baseline_path[0]) {
+        int n = baseline_load(cfg.baseline_path);
+        if (n >= 0)
+            fprintf(stderr, "info: loaded baseline profile (%d comm(s)) from %s\n",
+                    n, cfg.baseline_path);
+        else
+            fprintf(stderr, "warning: could not load baseline profile %s\n",
+                    cfg.baseline_path);
+    }
 
     /* Ignore SIGPIPE so piped consumers (jq, etc.) can exit without crashing us */
     signal(SIGPIPE, SIG_IGN);
@@ -331,12 +448,13 @@ int main(int argc, char **argv)
     skel = argus_bpf__open();
     if (!skel) {
         fprintf(stderr, "error: failed to open BPF skeleton\n");
-        return 1;
+        err = 1;
+        goto cleanup;
     }
 
     bpf_map__set_max_entries(skel->maps.rb,
                              (uint32_t)cfg.ring_buffer_kb * 1024);
-    configure_programs(skel, cfg.filter.event_mask);
+    configure_programs(skel, cfg.filter.event_mask, cfg.follow_pid);
 
     err = argus_bpf__load(skel);
     if (err) {
@@ -344,7 +462,8 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    setup_bpf_filters(skel, &cfg.filter, cfg.rate_limit_per_comm);
+    setup_bpf_filters(skel, &cfg.filter, cfg.rate_limit_per_comm,
+                      cfg.follow_pid);
 
     err = argus_bpf__attach(skel);
     if (err) {
@@ -392,13 +511,19 @@ int main(int argc, char **argv)
             cfg_load("/etc/argus/config.json", &new_cfg);
             if (cfg_home_path[0])
                 cfg_load(cfg_home_path, &new_cfg);
-            /* Update BPF maps with new filter/rate settings */
-            setup_bpf_filters(skel, &new_cfg.filter, new_cfg.rate_limit_per_comm);
-            /* Update userspace filter (path, excludes, event_mask) */
+            /* Preserve follow_pid — it's a startup-time CLI option */
+            setup_bpf_filters(skel, &new_cfg.filter, new_cfg.rate_limit_per_comm,
+                              cfg.follow_pid);
             output_update_filter(&new_cfg.filter);
-            /* Propagate to the live cfg (keep ring_buffer_kb/summary fixed) */
             cfg.filter              = new_cfg.filter;
             cfg.rate_limit_per_comm = new_cfg.rate_limit_per_comm;
+            /* Reload rules if path is configured */
+            if (cfg.rules_path[0]) {
+                rules_free();
+                int n = rules_load(cfg.rules_path);
+                if (n > 0)
+                    fprintf(stderr, "info: reloaded %d alert rule(s)\n", n);
+            }
             fprintf(stderr, "info: configuration reloaded (SIGHUP)\n");
         }
 
@@ -406,6 +531,10 @@ int main(int argc, char **argv)
         output_summary_tick(delta);
         if (delta && !cfg.summary_interval)
             print_drops(delta);
+        if (forwarding) {
+            if (delta) forward_drops(delta);
+            forward_tick();
+        }
     }
 
     /* Final drop check before exit */
@@ -413,8 +542,20 @@ int main(int argc, char **argv)
     if (delta)
         print_drops(delta);
 
+    /* Flush learning data if still in window at shutdown */
+    baseline_flush();
+
     ring_buffer__free(rb);
 cleanup:
-    argus_bpf__destroy(skel);
+    if (skel)
+        argus_bpf__destroy(skel);
+    output_fini();
+    rules_free();
+    baseline_free();
+    dns_free();
+    if (forwarding)
+        forward_fini();
+    if (output_file)
+        fclose(output_file);
     return err < 0 ? -err : err;
 }

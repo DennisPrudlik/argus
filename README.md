@@ -46,6 +46,22 @@ sudo make install      # installs binary, systemd unit, tmpfiles.d, and logrotat
 sudo make uninstall    # removes all of the above
 ```
 
+### Packages
+
+Build a native package for deployment on other machines:
+
+```sh
+# Debian / Ubuntu (.deb) — requires dpkg-deb
+make deb
+# → argus_0.1.0_x86_64.deb
+
+# Fedora / RHEL (.rpm) — requires rpmbuild
+make rpm
+# → ~/rpmbuild/RPMS/.../argus-0.1.0-1.x86_64.rpm
+```
+
+Both packages install the binary to `/usr/local/bin/argus` and include the systemd unit, tmpfiles.d config, and logrotate config.
+
 To run as a persistent daemon:
 
 ```sh
@@ -68,6 +84,7 @@ sudo ./argus [OPTIONS]
 |---|---|
 | `--config <path>` | Load config file (see [Config file](#config-file)) |
 | `--pid <pid>` | Only trace this PID (enforced in kernel) |
+| `--follow <pid>` | Trace PID and all descendant processes (BPF fork tracking) |
 | `--comm <name>` | Only trace this process name (enforced in kernel) |
 | `--path <str>` | Only show file events whose path contains this string (userspace) |
 | `--exclude <pfx>` | Exclude file events (OPEN, UNLINK, RENAME, CHMOD) whose path starts with this prefix (repeatable) |
@@ -75,6 +92,13 @@ sudo ./argus [OPTIONS]
 | `--rate-limit <n>` | Drop events after N per second per process name (0 = off, kernel-enforced) |
 | `--ringbuf <kb>` | Ring buffer size in KB (default: 256) |
 | `--summary <secs>` | Rolling summary every N seconds instead of per-event output |
+| `--output <path>` | Write event stream to file instead of stdout (opened in append mode) |
+| `--syslog` | Emit events to syslog (`LOG_DAEMON`) instead of stdout |
+| `--rules <path>` | Load alert rules from JSON file (see [Alert rules](#alert-rules)) |
+| `--forward <host:port>` | Stream JSON events to a remote TCP listener (see [Forwarding](#forwarding)) |
+| `--baseline <path>` | Detect anomalies against a learnt profile (see [Baseline mode](#baseline--anomaly-mode)) |
+| `--baseline-learn <secs>` | Learn a baseline profile for N seconds |
+| `--baseline-out <path>` | File to write the learnt baseline profile (default: `baseline.json`) |
 | `--json` | Emit newline-delimited JSON instead of a text table |
 | `--no-drop-privs` | Stay root after attach (not recommended) |
 | `--config-check` | Validate config file(s) and print active settings, then exit |
@@ -90,7 +114,10 @@ sudo ./argus
 # Watch only curl activity
 sudo ./argus --comm curl
 
-# Watch a specific PID
+# Watch a specific PID and all its children recursively
+sudo ./argus --follow 1234
+
+# Watch a specific PID (no children)
 sudo ./argus --pid 1234
 
 # Watch file opens under /etc, excluding /proc and /sys noise
@@ -122,6 +149,31 @@ sudo ./argus --config /etc/argus/config.json
 
 # Reload config without restarting
 sudo kill -HUP $(pidof argus)
+
+# Write events to a persistent file instead of stdout
+sudo ./argus --json --output /var/log/argus/events.jsonl
+
+# Emit all events to syslog (daemon facility)
+sudo ./argus --syslog
+
+# Load alert rules and emit alerts to stderr (text) or inline (JSON)
+sudo ./argus --rules /etc/argus/rules.json --json
+
+# Combine: daemon mode with rules
+sudo ./argus --syslog --rules /etc/argus/rules.json
+
+# Forward all events to a remote SIEM over TCP
+sudo ./argus --forward siem.internal:9000 --json
+
+# Forward + local file copy simultaneously
+sudo ./argus --forward siem.internal:9000 --output /var/log/argus/events.jsonl --json
+
+# IPv6 receiver
+sudo ./argus --forward '[::1]:9000'
+
+# Learn a baseline for 1 hour, then use it for anomaly detection
+sudo ./argus --baseline-learn 3600 --baseline-out /etc/argus/baseline.json
+sudo ./argus --baseline /etc/argus/baseline.json --json
 ```
 
 ## Output
@@ -148,7 +200,7 @@ One object per line, suitable for `jq`, log shippers, or SIEMs:
 ```json
 {"type":"EXEC","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"comm":"curl","cgroup":"","lineage":"systemd→sshd→bash","duration_ns":41238,"success":true,"filename":"/usr/bin/curl","args":"example.com"}
 {"type":"OPEN","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"comm":"curl","cgroup":"","lineage":"systemd→sshd→bash","duration_ns":9812,"success":true,"filename":"/etc/ssl/certs/ca-certificates.crt"}
-{"type":"CONNECT","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"comm":"curl","cgroup":"","lineage":"systemd→sshd→bash","duration_ns":2301,"success":true,"family":2,"daddr":"93.184.216.34","dport":443}
+{"type":"CONNECT","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"comm":"curl","cgroup":"","lineage":"systemd→sshd→bash","duration_ns":2301,"success":true,"family":2,"daddr":"93.184.216.34","hostname":"example.com","dport":443}
 {"type":"EXIT","pid":3821,"ppid":3820,"uid":1000,"gid":1000,"comm":"curl","cgroup":"","lineage":"systemd→sshd→bash","duration_ns":0,"success":true,"exit_code":0}
 {"type":"UNLINK","pid":4102,"ppid":4100,"uid":0,"gid":0,"comm":"rm","cgroup":"docker-abc123.scope","lineage":"systemd→containerd→sh","duration_ns":312,"success":true,"filename":"/tmp/secret.key"}
 {"type":"PTRACE","pid":8801,"ppid":8800,"uid":0,"gid":0,"comm":"gdb","cgroup":"","lineage":"systemd→sshd→bash","duration_ns":88,"success":true,"ptrace_req":16,"target_pid":3821}
@@ -201,13 +253,21 @@ Argus loads `/etc/argus/config.json` then `~/.config/argus/config.json` on start
 ```json
 {
     "pid": 0,
+    "follow_pid": 0,
     "comm": "",
     "path": "",
     "exclude_paths": ["/proc", "/sys", "/dev"],
     "event_types": ["EXEC", "OPEN", "EXIT", "CONNECT", "UNLINK", "RENAME", "CHMOD", "BIND", "PTRACE"],
     "ring_buffer_kb": 256,
     "summary_interval": 0,
-    "rate_limit_per_comm": 0
+    "rate_limit_per_comm": 0,
+    "output_path": "",
+    "syslog": false,
+    "rules": "",
+    "forward": "",
+    "baseline": "",
+    "baseline_out": "",
+    "baseline_learn_secs": 0
 }
 ```
 
@@ -219,6 +279,74 @@ A config file is the recommended way to run argus as a persistent daemon — set
 
 `--rate-limit N` enforces a per-comm sliding-window token bucket inside the BPF programs: once a process name emits more than N events per second, further events from that comm are silently dropped until the next 1-second window opens. Useful to prevent a single noisy process (e.g. a busy web server) from saturating the ring buffer.
 
+## PID subtree tracking (`--follow`)
+
+`--follow <pid>` traces a process and all its descendants — children, grandchildren, and so on — dynamically as they are spawned. The BPF `sched_process_fork` tracepoint propagates the tracked set: whenever a fork/clone is observed from a followed PID, the child is added to the `follow_pids` BPF map automatically. When a followed process exits, it is removed from the map.
+
+This is useful for tracing the complete activity of a service tree without knowing all its PIDs in advance:
+
+```sh
+# Trace nginx and every worker process it spawns
+sudo ./argus --follow $(pidof nginx | awk '{print $1}')
+
+# Trace a shell session and everything it runs
+sudo ./argus --follow $$
+```
+
+Unlike `--pid` (which is a static allowlist), `--follow` tracks process trees dynamically. Both can be combined: `--pid` for a static set, `--follow` for a subtree.
+
+## DNS reverse-lookup
+
+CONNECT and BIND events automatically include a reverse-DNS hostname lookup. Results are cached in a 512-entry table with a 300-second TTL so `getnameinfo()` is only called once per unique address per window.
+
+**Text output:**
+```
+CONN   3821    3820    1000  1000  curl   -   systemd→bash   [OK] example.com (93.184.216.34):443
+```
+
+**JSON output** — adds a `hostname` field next to `daddr`/`laddr`:
+```json
+{"type":"CONNECT",...,"daddr":"93.184.216.34","hostname":"example.com","dport":443}
+```
+
+When reverse resolution fails (no PTR record), `hostname` equals the dotted-decimal address and the text output shows the IP only.
+
+## Baseline / anomaly mode
+
+Argus can learn the normal behaviour of each process name over a time window and then alert on deviations. This is useful for detecting unexpected outbound connections, new binaries executing under a web server, or unusual file access patterns.
+
+### Learning
+
+```sh
+# Learn for 1 hour and write the profile
+sudo ./argus --baseline-learn 3600 --baseline-out /etc/argus/baseline.json
+```
+
+The profile records per-comm:
+- `exec_targets` — filenames of every successful `execve`
+- `connect_dests` — `addr:port` pairs from every successful `connect`
+- `open_paths` — filenames of every successful `open`
+
+### Detection
+
+```sh
+sudo ./argus --baseline /etc/argus/baseline.json --json
+```
+
+Each new event is checked against the learnt profile for its `comm`. If an EXEC target, CONNECT destination, or OPEN path has not been seen before, an anomaly alert is emitted:
+
+**Text mode (stderr):**
+```
+[ANOMALY] comm=nginx           pid=4102    new_connect_dest: 198.51.100.5:4444
+```
+
+**JSON mode (inline):**
+```json
+{"type":"ANOMALY","severity":"HIGH","comm":"nginx","pid":4102,"what":"new_connect_dest","value":"198.51.100.5:4444"}
+```
+
+Baseline detection and alert rules run simultaneously — combine both for defence-in-depth.
+
 ## Config reload (SIGHUP)
 
 Send `SIGHUP` to reload config files without restarting:
@@ -229,7 +357,172 @@ sudo kill -HUP $(pidof argus)
 sudo systemctl reload argus
 ```
 
-On SIGHUP, argus re-reads `/etc/argus/config.json` and `~/.config/argus/config.json` and immediately updates the BPF filter maps (pid/comm allowlists, rate limit) and the userspace filters (path, excludes). The event type mask and ring buffer size remain fixed for the lifetime of the process — changing those requires a restart.
+On SIGHUP, argus re-reads `/etc/argus/config.json` and `~/.config/argus/config.json` and immediately updates the BPF filter maps (pid/comm allowlists, rate limit), the userspace filters (path, excludes), and reloads the alert rules file. The event type mask and ring buffer size remain fixed for the lifetime of the process — changing those requires a restart.
+
+## Alert rules
+
+Argus can evaluate a set of detection rules against every event and emit alerts for matches. Load rules with `--rules <path>` or set the `rules` key in the config file.
+
+### Rule file format
+
+A JSON array of rule objects. All match fields are optional — omit to match any value:
+
+```json
+[
+    {
+        "name":          "World-writable chmod",
+        "severity":      "high",
+        "type":          "CHMOD",
+        "mode_mask":     2,
+        "message":       "{comm} made {filename} world-writable (mode=0{mode})"
+    },
+    {
+        "name":          "Ptrace injection attempt",
+        "severity":      "critical",
+        "type":          "PTRACE",
+        "message":       "{comm} (pid={pid}) traced pid={target_pid} req={ptrace_req}"
+    },
+    {
+        "name":          "Root file deletion",
+        "severity":      "medium",
+        "type":          "UNLINK",
+        "uid":           0,
+        "message":       "root deleted {filename}"
+    },
+    {
+        "name":          "Suspicious shadow access",
+        "severity":      "high",
+        "path_contains": "/etc/shadow",
+        "message":       "{comm} (uid={uid}) accessed {filename}"
+    },
+    {
+        "name":          "Netcat execution",
+        "severity":      "low",
+        "type":          "EXEC",
+        "comm":          "nc",
+        "message":       "netcat started by pid={ppid} lineage={comm}"
+    }
+]
+```
+
+### Rule fields
+
+| Field | Type | Description |
+|---|---|---|
+| `name` | string | Rule name — required, shown in alert output |
+| `severity` | string | `info` \| `low` \| `medium` \| `high` \| `critical` |
+| `type` | string | Event type to match (`EXEC`, `OPEN`, `CHMOD`, etc.); omit to match all |
+| `comm` | string | Exact process name match; omit to match any |
+| `uid` | int | Exact UID match; `-1` or omit to match any |
+| `path_contains` | string | Substring match on `filename`; omit to match any |
+| `mode_mask` | int | CHMOD only: fire if `(mode & mode_mask) != 0` |
+| `message` | string | Alert message with `{variable}` substitution |
+
+### Message template variables
+
+`{comm}` `{pid}` `{ppid}` `{uid}` `{gid}` `{cgroup}` `{filename}` `{args}` `{new_path}` `{mode}` `{target_pid}` `{ptrace_req}` `{daddr}` `{dport}` `{laddr}` `{lport}`
+
+### Alert output
+
+**Text mode** — alerts go to stderr so the event table on stdout stays clean:
+```
+[ALERT:high] World-writable chmod: chmod made /etc/cron.d/job world-writable (mode=0777)
+[ALERT:critical] Ptrace injection attempt: gdb (pid=8801) traced pid=3821 req=16
+```
+
+**JSON mode** — alerts appear inline in the event stream:
+```json
+{"type":"ALERT","severity":"high","rule":"World-writable chmod","pid":4102,"ppid":4100,"uid":0,"comm":"chmod","message":"chmod made /etc/cron.d/job world-writable (mode=0777)"}
+```
+
+**Syslog mode** — alerts are sent at the appropriate priority (`LOG_INFO` through `LOG_CRIT`):
+```
+argus[1234]: ALERT:high rule=World-writable chmod pid=4102 comm=chmod chmod made /etc/cron.d/job world-writable
+```
+
+Rules are reloaded on `SIGHUP` — edit the rules file and send HUP to deploy new detections without restarting argus.
+
+## Output modes
+
+| Flag | Description |
+|---|---|
+| *(default)* | Text table to stdout |
+| `--json` | Newline-delimited JSON to stdout (or `--output` file) |
+| `--output <path>` | Append event stream to file; compatible with `--json` |
+| `--syslog` | All events go to `syslog(LOG_DAEMON)`; overrides `--json` and `--output` |
+
+`--output` opens the file in append mode so it survives log rotation. The systemd service uses stdout redirection by default; `--output` is most useful when running argus outside of systemd.
+
+## Forwarding
+
+`--forward host:port` streams every matched event as newline-delimited JSON over a persistent TCP connection.  The remote listener receives the same JSON objects produced by `--json`; `{"type":"DROP","count":N}` records are forwarded whenever the ring buffer drops events.
+
+```sh
+# Any TCP listener works — netcat for quick testing
+nc -lk 9000
+
+# Production: Vector, Logstash, Fluent Bit, Loki, custom receiver
+sudo ./argus --forward siem.internal:9000
+
+# IPv6
+sudo ./argus --forward '[::1]:9000'
+```
+
+### Reliability behaviour
+
+| Condition | Behaviour |
+|---|---|
+| Remote unreachable at startup | Non-fatal warning; retries with exponential backoff (1 s → 2 s → … → 30 s) |
+| Connection lost mid-run | Reconnects automatically with same backoff |
+| Send buffer full (slow receiver) | Event dropped and counted; drop count sent as `{"type":"DROP","count":N}` on next reconnect |
+| `SIGHUP` | Reconnects and reloads config; forward address fixed for the lifetime of the process |
+
+### Combining output modes
+
+`--forward` is independent of `--output`, `--syslog`, and `--json` — they can all be active at once:
+
+```sh
+# Forward to SIEM, write local copy, show human-readable table on stdout
+sudo ./argus --forward siem.internal:9000 \
+             --output /var/log/argus/events.jsonl \
+             --json
+```
+
+In this configuration:
+- **stdout** — JSON stream (or text table without `--json`)
+- **`--output` file** — JSON stream appended to disk
+- **`--forward` socket** — JSON stream to remote receiver
+- **`--syslog`** — if also set, overrides stdout and `--output`; forwarding continues independently
+
+### Config file
+
+```json
+{
+    "forward": "siem.internal:9000"
+}
+```
+
+### Receiver example (Python)
+
+```python
+import socket, json
+
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(('', 9000))
+srv.listen(1)
+print("waiting for argus...")
+conn, addr = srv.accept()
+print(f"connected: {addr}")
+buf = ""
+for chunk in iter(lambda: conn.recv(4096).decode(), ""):
+    buf += chunk
+    while '\n' in buf:
+        line, buf = buf.split('\n', 1)
+        if line:
+            event = json.loads(line)
+            print(event.get('type'), event.get('comm'), event.get('pid'))
+```
 
 ## Security
 
@@ -283,7 +576,7 @@ make test-asan
 make test-integration
 ```
 
-Unit tests cover `event_matches` filter logic (pid, comm, path, excludes, event mask) and the lineage cache (chain building, tombstone deletion, buffer truncation). Integration tests start argus with `--pid`, `--comm`, `--events`, and `--exclude` filters against live kernel events and verify only matching events appear in the output.
+Unit tests cover `event_matches` filter logic (pid, comm, path, excludes, event mask), the lineage cache (chain building, tombstone deletion, buffer truncation), the alert rules engine (rule loading, field matching, message template expansion, JSON alert output), and TCP forwarding (address parsing, live TCP send/receive, NDJSON framing, drop reporting). Integration tests start argus against live kernel events and verify: `--pid`, `--comm`, `--events`, `--exclude`, each of the 5 new event types (UNLINK, RENAME, CHMOD, BIND, PTRACE), `--rate-limit` drop behaviour, `--forward` TCP delivery, `--rules` alert firing, and `--output` file persistence.
 
 ## Performance tuning
 
@@ -318,18 +611,27 @@ Every push and pull request to `main` runs the full test suite on GitHub Actions
 ## Repository layout
 
 ```
-argus.bpf.c          eBPF kernel programs (execve, openat, connect, sched_process_exit)
+argus.bpf.c          eBPF kernel programs (execve, openat, connect, unlinkat, renameat2,
+                       fchmodat, bind, ptrace, sched_process_exit, sched_process_fork)
 argus.c              Userspace loader, ring buffer consumer, CLI
-output.c/h           Text and JSON formatting, filtering, summary mode
+output.c/h           Text, JSON, and syslog formatting; filtering; summary mode;
+                       file output (--output) support; DNS hostname in CONNECT/BIND
+rules.c/h            Alert rule engine: JSON rule loading, event matching, alert emission
+forward.c/h          TCP event forwarding: non-blocking send, reconnect with backoff
+dns.c/h              Reverse-DNS lookup cache (512 entries, 300 s TTL)
+baseline.c/h         Baseline / anomaly detection: learn per-comm profiles, alert on deviations
 lineage.c/h          Userspace process ancestry cache
 config.c/h           JSON config file parser
 argus.h              Shared event struct, type definitions, TRACE_* bitmasks
+argus.spec           RPM spec file (make rpm)
 argus.service        systemd service unit
 argus.tmpfiles       systemd-tmpfiles config for /var/log/argus pre-creation
 argus.logrotate      logrotate config (daily, 14 days, compressed)
-tests/               Unit tests (test_lineage.c, test_output.c) and integration test (test_filter.sh)
+tests/               Unit tests (test_lineage.c, test_output.c, test_rules.c,
+                       test_forward.c) and integration test (test_filter.sh — 13 scenarios)
 lima/                Lima VM config for development on non-Linux hosts
 .devcontainer/       VS Code Dev Container config (alternative to Lima)
 .github/workflows/   GitHub Actions CI (ubuntu-latest + ubuntu-22.04 matrix)
-Makefile             Build entry point (targets: all, test, test-asan, test-integration, install, clean)
+Makefile             Build entry point (targets: all, test, test-asan, test-integration,
+                       install, deb, rpm, clean)
 ```

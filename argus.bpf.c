@@ -56,6 +56,18 @@ struct {
     __type(value, uint8_t);
 } filter_comms SEC(".maps");
 
+/*
+ * follow_pids — set of PIDs being tracked by --follow.
+ * Seed PID is inserted by userspace; child PIDs are added by
+ * handle_process_fork when their parent is present in the set.
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, uint32_t);
+    __type(value, uint8_t);
+} follow_pids SEC(".maps");
+
 /* ── Per-comm rate limiting ─────────────────────────────────────────────── */
 
 struct rate_slot {
@@ -98,6 +110,8 @@ static __always_inline int should_filter_out(uint32_t pid, char comm[16])
     if (cfg->filter_pid_active && !bpf_map_lookup_elem(&filter_pids, &pid))
         return 1;
     if (cfg->filter_comm_active && !bpf_map_lookup_elem(&filter_comms, comm))
+        return 1;
+    if (cfg->filter_follow_active && !bpf_map_lookup_elem(&follow_pids, &pid))
         return 1;
 
     if (cfg->rate_limit_per_comm > 0) {
@@ -320,23 +334,35 @@ int handle_process_exit(struct trace_event_raw_sched_process_template *ctx)
     uint32_t pid = bpf_get_current_pid_tgid() >> 32;
     char comm[16] = {};
     bpf_get_current_comm(comm, sizeof(comm));
-    if (should_filter_out(pid, comm))
-        return 0;
 
-    event_t *e = bpf_ringbuf_reserve(&rb, sizeof(event_t), 0);
-    if (!e) {
-        note_drop();
-        return 0;
+    if (should_filter_out(pid, comm))
+        goto cleanup;
+
+    {
+        event_t *e = bpf_ringbuf_reserve(&rb, sizeof(event_t), 0);
+        if (!e) {
+            note_drop();
+            goto cleanup;
+        }
+
+        e->type    = EVENT_EXIT;
+        e->success = true;
+        fill_common(e, pid, comm);
+
+        struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+        e->exit_code = (BPF_CORE_READ(task, exit_code) >> 8) & 0xff;
+
+        bpf_ringbuf_submit(e, 0);
     }
 
-    e->type    = EVENT_EXIT;
-    e->success = true;
-    fill_common(e, pid, comm);
-
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-    e->exit_code = (BPF_CORE_READ(task, exit_code) >> 8) & 0xff;
-
-    bpf_ringbuf_submit(e, 0);
+cleanup:
+    /* Remove exited PID from follow set so it doesn't linger */
+    {
+        uint32_t zero = 0;
+        argus_config_t *cfg = bpf_map_lookup_elem(&config_map, &zero);
+        if (cfg && cfg->filter_follow_active)
+            bpf_map_delete_elem(&follow_pids, &pid);
+    }
     return 0;
 }
 
@@ -813,6 +839,30 @@ int handle_ptrace_exit(struct trace_event_raw_sys_exit *ctx)
 
 cleanup:
     bpf_map_delete_elem(&ptraces, &id);
+    return 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Sched fork — tracepoint/sched/sched_process_fork
+ * Propagates the follow_pids set to child processes when --follow is active.
+ * Only runs when filter_follow_active == 1; disabled at load time otherwise.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+SEC("tracepoint/sched/sched_process_fork")
+int handle_process_fork(struct trace_event_raw_sched_process_fork *ctx)
+{
+    uint32_t zero = 0;
+    argus_config_t *cfg = bpf_map_lookup_elem(&config_map, &zero);
+    if (!cfg || !cfg->filter_follow_active)
+        return 0;
+
+    uint32_t parent_pid = ctx->parent_pid;
+    uint32_t child_pid  = ctx->child_pid;
+
+    if (bpf_map_lookup_elem(&follow_pids, &parent_pid)) {
+        uint8_t val = 1;
+        bpf_map_update_elem(&follow_pids, &child_pid, &val, BPF_ANY);
+    }
     return 0;
 }
 

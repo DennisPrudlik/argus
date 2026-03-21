@@ -176,6 +176,25 @@ int cfg_load(const char *path, argus_cfg_t *cfg)
             p = parse_int(p, &v);
             cfg->rate_limit_per_comm = (uint32_t)v;
         }
+        else if (strcmp(key, "forward") == 0)
+            p = parse_str(p, cfg->forward_addr, sizeof(cfg->forward_addr));
+        else if (strcmp(key, "syslog") == 0) {
+            int v = 0;
+            p = parse_bool(p, &v);
+            cfg->use_syslog = v;
+        }
+        else if (strcmp(key, "output_path") == 0)
+            p = parse_str(p, cfg->output_path, sizeof(cfg->output_path));
+        else if (strcmp(key, "rules") == 0)
+            p = parse_str(p, cfg->rules_path, sizeof(cfg->rules_path));
+        else if (strcmp(key, "follow_pid") == 0)
+            p = parse_int(p, &cfg->follow_pid);
+        else if (strcmp(key, "baseline") == 0)
+            p = parse_str(p, cfg->baseline_path, sizeof(cfg->baseline_path));
+        else if (strcmp(key, "baseline_out") == 0)
+            p = parse_str(p, cfg->baseline_out, sizeof(cfg->baseline_out));
+        else if (strcmp(key, "baseline_learn_secs") == 0)
+            p = parse_int(p, &cfg->baseline_learn_secs);
         else if (strcmp(key, "event_types") == 0)
             parse_event_types(p, &cfg->filter.event_mask);
         else if (strcmp(key, "exclude_paths") == 0) {
