@@ -52,4 +52,10 @@ void webhook_fire(const char *json_body);
  */
 void webhook_destroy(void);
 
+/*
+ * Read current statistics (all pointers may be NULL to skip that value).
+ * Thread-safe; non-blocking.
+ */
+void webhook_stats(uint64_t *posts, uint64_t *drops, int *queue_depth);
+
 #endif /* __WEBHOOK_H */

@@ -13,6 +13,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sqlite3.h>
+#include <stdatomic.h>
 #include "argus.h"
 
 /* ── compile-time tunables ─────────────────────────────────────────────── */
@@ -70,6 +71,11 @@ static int           g_q_tail = 0;   /* reader advances tail */
 static pthread_mutex_t g_q_lock  = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_q_cond  = PTHREAD_COND_INITIALIZER;
 static volatile int    g_q_stop  = 0;
+
+/* ── statistics ─────────────────────────────────────────────────────────── */
+
+static _Atomic uint64_t g_stat_inserts = 0;
+static _Atomic uint64_t g_stat_errors  = 0;
 
 /* ── SQLite state ──────────────────────────────────────────────────────── */
 
@@ -243,7 +249,10 @@ static void insert_event(const event_t *ev)
                        -1, SQLITE_STATIC);
     sqlite3_bind_text (g_ins_stmt, 10, detail[0] ? detail : NULL,
                        -1, SQLITE_STATIC);
-    sqlite3_step(g_ins_stmt);
+    if (sqlite3_step(g_ins_stmt) == SQLITE_DONE)
+        atomic_fetch_add(&g_stat_inserts, 1);
+    else
+        atomic_fetch_add(&g_stat_errors, 1);
 }
 
 static void *writer_thread(void *arg)
@@ -607,6 +616,12 @@ void store_event(const event_t *ev)
     g_q_head = next;
     pthread_cond_signal(&g_q_cond);
     pthread_mutex_unlock(&g_q_lock);
+}
+
+void store_stats(uint64_t *inserts, uint64_t *errors)
+{
+    if (inserts) *inserts = atomic_load(&g_stat_inserts);
+    if (errors)  *errors  = atomic_load(&g_stat_errors);
 }
 
 void store_destroy(void)

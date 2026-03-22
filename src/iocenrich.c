@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #include <time.h>
 #include <errno.h>
@@ -53,6 +54,11 @@ static pthread_mutex_t g_q_lock  = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_q_cond  = PTHREAD_COND_INITIALIZER;
 static volatile int    g_q_stop  = 0;
 static pthread_t       g_worker;
+
+/* ── statistics ─────────────────────────────────────────────────────────── */
+static _Atomic uint64_t g_stat_lookups     = 0;
+static _Atomic uint64_t g_stat_cache_hits  = 0;
+static _Atomic uint64_t g_stat_cache_miss  = 0;
 
 /* ── API keys ──────────────────────────────────────────────────────────── */
 
@@ -362,12 +368,15 @@ static int otx_query(const ioc_req_t *req)
 static void process_request(const ioc_req_t *req)
 {
     /* Check cache first */
+    atomic_fetch_add(&g_stat_lookups, 1);
+
     pthread_mutex_lock(&g_cache_lock);
     cache_entry_t *hit = cache_lookup(req->value);
     if (hit) {
         /* Already cached — re-emit alert if it was a positive result */
         int vm = hit->vt_malicious, vt = hit->vt_total, op = hit->otx_pulses;
         pthread_mutex_unlock(&g_cache_lock);
+        atomic_fetch_add(&g_stat_cache_hits, 1);
 
         if (vm > 0) {
             fprintf(stderr,
@@ -383,6 +392,7 @@ static void process_request(const ioc_req_t *req)
         return;
     }
     pthread_mutex_unlock(&g_cache_lock);
+    atomic_fetch_add(&g_stat_cache_miss, 1);
 
     /* Query VirusTotal */
     int vt_malicious = -1, vt_total = 0;
@@ -525,6 +535,25 @@ void iocenrich_check(const event_t *ev)
     }
     /* else queue full — silently drop to stay non-blocking */
     pthread_mutex_unlock(&g_q_lock);
+}
+
+void iocenrich_stats(uint64_t *lookups, uint64_t *hits, uint64_t *misses)
+{
+    if (lookups) *lookups = atomic_load(&g_stat_lookups);
+    if (hits)    *hits    = atomic_load(&g_stat_cache_hits);
+    if (misses)  *misses  = atomic_load(&g_stat_cache_miss);
+}
+
+void iocenrich_update_keys(const char *vt_key, const char *otx_key)
+{
+    if (vt_key) {
+        strncpy(g_vt_key, vt_key, sizeof(g_vt_key) - 1);
+        g_vt_key[sizeof(g_vt_key) - 1] = '\0';
+    }
+    if (otx_key) {
+        strncpy(g_otx_key, otx_key, sizeof(g_otx_key) - 1);
+        g_otx_key[sizeof(g_otx_key) - 1] = '\0';
+    }
 }
 
 void iocenrich_destroy(void)

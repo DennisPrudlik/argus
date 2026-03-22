@@ -21,11 +21,15 @@
  * Without HAVE_OPENSSL all functions compile to no-ops.
  */
 
+#include <stdint.h>
+
 #ifdef HAVE_OPENSSL
 
 void iocenrich_init(const char *vt_api_key, const char *otx_api_key);
 void iocenrich_check(const event_t *ev);
 void iocenrich_destroy(void);
+void iocenrich_stats(uint64_t *lookups, uint64_t *hits, uint64_t *misses);
+void iocenrich_update_keys(const char *vt_key, const char *otx_key);
 
 #else /* !HAVE_OPENSSL */
 
@@ -35,6 +39,10 @@ static inline void iocenrich_init(const char *vt, const char *otx)
 }
 static inline void iocenrich_check(const event_t *ev)  { (void)ev; }
 static inline void iocenrich_destroy(void)              {}
+static inline void iocenrich_stats(uint64_t *l, uint64_t *h, uint64_t *m)
+    { (void)l; (void)h; (void)m; }
+static inline void iocenrich_update_keys(const char *vt, const char *otx)
+    { (void)vt; (void)otx; }
 
 #endif /* HAVE_OPENSSL */
 

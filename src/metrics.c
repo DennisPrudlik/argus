@@ -10,6 +10,9 @@
 #include <arpa/inet.h>
 #include "metrics.h"
 #include "argus.h"
+#include "webhook.h"
+#include "iocenrich.h"
+#include "store.h"
 
 /* ── atomic counters ─────────────────────────────────────────────────────── */
 
@@ -132,6 +135,62 @@ static void write_metrics(int cfd)
                "# TYPE argus_forward_connections_total counter\n"
                "argus_forward_connections_total %llu\n",
             (unsigned long long)atomic_load(&g_fwd_connects));
+
+    /* ── Enterprise module metrics ──────────────────────────────────────── */
+
+    /* Webhook dispatcher */
+    {
+        uint64_t posts = 0, drops = 0;
+        int      depth = 0;
+        webhook_stats(&posts, &drops, &depth);
+        fprintf(f,
+            "# HELP argus_webhook_posts_total Webhook HTTP POSTs sent successfully\n"
+            "# TYPE argus_webhook_posts_total counter\n"
+            "argus_webhook_posts_total %llu\n"
+            "# HELP argus_webhook_drops_total Webhook payloads dropped (queue full)\n"
+            "# TYPE argus_webhook_drops_total counter\n"
+            "argus_webhook_drops_total %llu\n"
+            "# HELP argus_webhook_queue_depth Current webhook dispatch queue depth\n"
+            "# TYPE argus_webhook_queue_depth gauge\n"
+            "argus_webhook_queue_depth %d\n",
+            (unsigned long long)posts,
+            (unsigned long long)drops,
+            depth);
+    }
+
+    /* IOC enrichment cache */
+    {
+        uint64_t lookups = 0, hits = 0, misses = 0;
+        iocenrich_stats(&lookups, &hits, &misses);
+        fprintf(f,
+            "# HELP argus_ioc_lookups_total Total IOC enrichment lookups\n"
+            "# TYPE argus_ioc_lookups_total counter\n"
+            "argus_ioc_lookups_total %llu\n"
+            "# HELP argus_ioc_cache_hits_total IOC lookups served from cache\n"
+            "# TYPE argus_ioc_cache_hits_total counter\n"
+            "argus_ioc_cache_hits_total %llu\n"
+            "# HELP argus_ioc_cache_misses_total IOC lookups that required API calls\n"
+            "# TYPE argus_ioc_cache_misses_total counter\n"
+            "argus_ioc_cache_misses_total %llu\n",
+            (unsigned long long)lookups,
+            (unsigned long long)hits,
+            (unsigned long long)misses);
+    }
+
+    /* SQLite event store */
+    {
+        uint64_t inserts = 0, errors = 0;
+        store_stats(&inserts, &errors);
+        fprintf(f,
+            "# HELP argus_store_inserts_total Events successfully inserted into SQLite store\n"
+            "# TYPE argus_store_inserts_total counter\n"
+            "argus_store_inserts_total %llu\n"
+            "# HELP argus_store_errors_total SQLite insert errors\n"
+            "# TYPE argus_store_errors_total counter\n"
+            "argus_store_errors_total %llu\n",
+            (unsigned long long)inserts,
+            (unsigned long long)errors);
+    }
 
     fflush(f);
     fclose(f);

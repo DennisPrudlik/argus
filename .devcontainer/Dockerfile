@@ -15,12 +15,19 @@ RUN apt-get update && apt-get install -y \
     # bpftool (versioned path under linux-tools-generic)
     linux-tools-common \
     linux-tools-generic \
+    # Optional features: SQLite event store, TLS forwarding, TLS inspection
+    pkg-config \
+    libsqlite3-dev \
+    libssl-dev \
+    # Optional: YARA rule scanning (uncomment if needed)
+    # libyara-dev \
     # Useful for inspecting maps / programs at runtime
     bpftrace \
     strace \
     # General utilities
     git \
     curl \
+    vim \
     && rm -rf /var/lib/apt/lists/*
 
 # linux-tools-generic installs bpftool under a versioned path like

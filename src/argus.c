@@ -1163,6 +1163,29 @@ int main(int argc, char **argv)
                 if (n > 0)
                     fprintf(stderr, "info: reloaded %d alert rule(s)\n", n);
             }
+            /* ── Enterprise module hot-reload ── */
+            /* Webhook: restart if URL changed */
+            if (strcmp(new_cfg.webhook_url, cfg.webhook_url) != 0) {
+                webhook_destroy();
+                if (new_cfg.webhook_url[0])
+                    webhook_init(new_cfg.webhook_url);
+            }
+            /* IOC enrichment: update API keys in-place (no restart needed) */
+            if (strcmp(new_cfg.vt_api_key,  cfg.vt_api_key)  != 0 ||
+                strcmp(new_cfg.otx_api_key, cfg.otx_api_key) != 0) {
+                iocenrich_update_keys(
+                    new_cfg.vt_api_key[0]  ? new_cfg.vt_api_key  : NULL,
+                    new_cfg.otx_api_key[0] ? new_cfg.otx_api_key : NULL);
+            }
+            /* Copy remaining enterprise fields */
+            cfg.webhook_url[0] = '\0';
+            strncpy(cfg.webhook_url,  new_cfg.webhook_url,  sizeof(cfg.webhook_url)  - 1);
+            strncpy(cfg.vt_api_key,   new_cfg.vt_api_key,   sizeof(cfg.vt_api_key)   - 1);
+            strncpy(cfg.otx_api_key,  new_cfg.otx_api_key,  sizeof(cfg.otx_api_key)  - 1);
+            cfg.mitre_tags      = new_cfg.mitre_tags;
+            cfg.exec_hash       = new_cfg.exec_hash;
+            cfg.container_enrich = new_cfg.container_enrich;
+            cfg.mem_forensics   = new_cfg.mem_forensics;
             fprintf(stderr, "info: configuration reloaded (SIGHUP)\n");
         }
 

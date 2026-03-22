@@ -28,11 +28,14 @@
  *   Anything else → 404.
  */
 
+#include <stdint.h>
+
 #ifdef HAVE_SQLITE3
 
 void store_init(const char *db_path, int query_port);
 void store_event(const event_t *ev);
 void store_destroy(void);
+void store_stats(uint64_t *inserts, uint64_t *errors);
 
 #else /* !HAVE_SQLITE3 */
 
@@ -42,6 +45,8 @@ static inline void store_init(const char *db_path, int query_port)
 }
 static inline void store_event(const event_t *ev)    { (void)ev; }
 static inline void store_destroy(void)               {}
+static inline void store_stats(uint64_t *i, uint64_t *e)
+    { (void)i; (void)e; }
 
 #endif /* HAVE_SQLITE3 */
 

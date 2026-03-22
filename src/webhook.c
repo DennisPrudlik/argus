@@ -3,11 +3,15 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include "webhook.h"
+
+#define WEBHOOK_CONNECT_TIMEOUT_S 5
 
 /* ── internal types ──────────────────────────────────────────────────── */
 
@@ -18,6 +22,10 @@ typedef struct {
 /* ── module state ────────────────────────────────────────────────────── */
 
 static int              g_initialized = 0;
+
+/* ── statistics (atomic, readable without lock) ──────────────────────── */
+static _Atomic uint64_t g_stat_posts = 0;   /* successful POSTs sent     */
+static _Atomic uint64_t g_stat_drops = 0;   /* entries dropped (q full)  */
 
 /* parsed URL components */
 static char             g_host[256];
@@ -59,6 +67,13 @@ static int connect_to_host(void)
         fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (fd < 0)
             continue;
+
+        /* Apply send/receive timeouts so a slow/dead endpoint can't block
+         * the worker thread indefinitely. */
+        struct timeval tv = { .tv_sec = WEBHOOK_CONNECT_TIMEOUT_S, .tv_usec = 0 };
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
         if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0)
             break;
         close(fd);
@@ -128,6 +143,7 @@ static void *worker_thread(void *arg)
         pthread_mutex_unlock(&g_mutex);
 
         send_post(local_body);
+        atomic_fetch_add(&g_stat_posts, 1);
     }
 
     return NULL;
@@ -198,7 +214,8 @@ void webhook_fire(const char *json_body)
 
     pthread_mutex_lock(&g_mutex);
     if (g_count >= WEBHOOK_QUEUE_SIZE) {
-        /* queue full — drop silently */
+        /* queue full — count the drop */
+        atomic_fetch_add(&g_stat_drops, 1);
         pthread_mutex_unlock(&g_mutex);
         return;
     }
@@ -209,6 +226,17 @@ void webhook_fire(const char *json_body)
     g_count++;
     pthread_cond_signal(&g_cond);
     pthread_mutex_unlock(&g_mutex);
+}
+
+void webhook_stats(uint64_t *posts, uint64_t *drops, int *queue_depth)
+{
+    if (posts)       *posts       = atomic_load(&g_stat_posts);
+    if (drops)       *drops       = atomic_load(&g_stat_drops);
+    if (queue_depth) {
+        pthread_mutex_lock(&g_mutex);
+        *queue_depth = g_count;
+        pthread_mutex_unlock(&g_mutex);
+    }
 }
 
 void webhook_destroy(void)
