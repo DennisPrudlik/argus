@@ -48,7 +48,7 @@ MANDIR       = $(DESTDIR)$(PREFIX)/share/man/man8
 VERSION     := $(shell grep 'ARGUS_VERSION' $(SRC)/argus.h | sed 's/.*"\(.*\)".*/\1/')
 ARCH_PKG    := $(shell uname -m)
 
-.PHONY: all clean test test-unit test-integration test-asan install uninstall deb rpm man
+.PHONY: all clean test test-unit test-integration test-asan install uninstall deb rpm man bench
 
 all: argus argus-server
 
@@ -127,9 +127,18 @@ tests/test_fim: tests/test_fim.c $(SRC)/fim.c $(SRC)/fim.h $(SRC)/argus.h
 tests/test_netcorr: tests/test_netcorr.c $(SRC)/threatintel.c $(SRC)/threatintel.h $(SRC)/argus.h
 	$(CC) $(CFLAGS) -o $@ tests/test_netcorr.c $(SRC)/threatintel.c -lpthread -lbpf -lm
 
+tests/test_enterprise: tests/test_enterprise.c \
+                       $(SRC)/output.c $(SRC)/lineage.c $(SRC)/dns.c $(SRC)/metrics.c \
+                       $(SRC)/compliance.c \
+                       $(SRC)/output.h $(SRC)/compliance.h $(SRC)/argus.h
+	$(CC) $(CFLAGS) -o $@ tests/test_enterprise.c \
+	    $(SRC)/output.c $(SRC)/lineage.c $(SRC)/dns.c $(SRC)/metrics.c \
+	    $(SRC)/compliance.c \
+	    -lpthread
+
 test-unit: tests/test_lineage tests/test_output tests/test_rules \
            tests/test_forward tests/test_baseline tests/test_metrics \
-           tests/test_fim tests/test_netcorr
+           tests/test_fim tests/test_netcorr tests/test_enterprise
 	@echo "── lineage ──────────────────────────────────"
 	@./tests/test_lineage
 	@echo "── output / filter ──────────────────────────"
@@ -146,6 +155,8 @@ test-unit: tests/test_lineage tests/test_output tests/test_rules \
 	@./tests/test_fim
 	@echo "── DNS correlation / entropy ────────────────"
 	@./tests/test_netcorr
+	@echo "── enterprise modules (v0.4.0) ──────────────"
+	@./tests/test_enterprise
 
 # ── integration test (requires root + built argus binary) ────────────────────
 test-integration: argus
@@ -191,6 +202,17 @@ test-asan: tests/test_lineage_asan tests/test_output_asan tests/test_rules_asan 
 	@echo "── metrics (ASAN) ───────────────────────────────"
 	@./tests/test_metrics_asan
 
+# ── benchmark ─────────────────────────────────────────────────────────────────
+
+BENCH_SRCS = tools/argus-bench.c $(SRC)/output.c $(SRC)/lineage.c \
+             $(SRC)/dns.c $(SRC)/metrics.c
+
+argus-bench: $(BENCH_SRCS) $(COMMON_HDRS)
+	$(CC) $(CFLAGS) -o $@ $(BENCH_SRCS) -lpthread
+
+bench: argus-bench
+	@echo "Built argus-bench — run with: ./argus-bench [N]"
+
 # Run unit tests only (no root required)
 test: test-unit
 
@@ -211,6 +233,8 @@ deb: argus argus-server
 	install -m644 packaging/argus.logrotate  pkg/deb$(LOGROTATEDIR)/argus
 	printf 'Package: argus\nVersion: $(VERSION)\nSection: security\nPriority: optional\nArchitecture: $(ARCH_PKG)\nDepends: libbpf0\nMaintainer: argus project\nDescription: eBPF-based syscall telemetry daemon\n argus monitors process execution, file access, network connections\n and security-relevant syscalls via eBPF tracepoints.\n' \
 	    > pkg/deb/DEBIAN/control
+	install -m755 packaging/debian/postinst pkg/deb/DEBIAN/postinst
+	install -m755 packaging/debian/prerm    pkg/deb/DEBIAN/prerm
 	dpkg-deb --build pkg/deb argus_$(VERSION)_$(ARCH_PKG).deb
 	rm -rf pkg/deb
 	@echo "Built: argus_$(VERSION)_$(ARCH_PKG).deb"
@@ -243,11 +267,12 @@ uninstall:
 	      $(TMPFILESDIR)/argus.conf $(LOGROTATEDIR)/argus $(MANDIR)/argus.8
 
 clean:
-	rm -f argus argus-server \
+	rm -f argus argus-server argus-bench \
 	      $(BPF_SRC)/argus.bpf.o $(BPF_SRC)/argus.skel.h $(BPF_SRC)/vmlinux.h \
 	      man/argus.8.gz \
 	      tests/test_lineage tests/test_output tests/test_rules tests/test_forward \
 	      tests/test_baseline tests/test_metrics tests/test_fim tests/test_netcorr \
+	      tests/test_enterprise \
 	      tests/test_lineage_asan tests/test_output_asan tests/test_rules_asan \
 	      tests/test_forward_asan tests/test_baseline_asan tests/test_metrics_asan
 	rm -rf pkg/

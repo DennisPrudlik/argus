@@ -27,10 +27,23 @@ jobs:
             gcc clang llvm \
             libbpf-dev libelf-dev zlib1g-dev \
             libssl-dev \
+            libsqlite3-dev \
+            pkg-config \
             python3
 
+      - name: Build test binaries
+        run: |
+          make tests/test_lineage tests/test_output tests/test_rules \
+               tests/test_forward tests/test_baseline tests/test_metrics \
+               tests/test_fim tests/test_netcorr tests/test_enterprise
+
       - name: Unit tests (normal)
-        run: make test
+        run: make test-unit
+        env:
+          ARGUS_TEST_TMPDIR: /tmp
+
+      - name: Enterprise module tests
+        run: ./tests/test_enterprise
 
       - name: Unit tests (ASAN / UBSan)
         run: make test-asan
@@ -116,3 +129,67 @@ jobs:
       - name: Integration tests
         if: steps.bpftool.outputs.found == 'true' && steps.bpf_load.outputs.ok == 'true'
         run: make test-integration
+
+# ── Benchmark build check ──────────────────────────────────────────────────────
+  bench-build:
+    name: Build benchmark tool
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            gcc libssl-dev libsqlite3-dev pkg-config \
+            libbpf-dev libelf-dev
+
+      - name: Build argus-bench
+        run: make bench
+
+# ── Debian package ─────────────────────────────────────────────────────────────
+  deb-build:
+    name: Build .deb package
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build + packaging dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            gcc clang llvm \
+            libbpf-dev libelf-dev zlib1g-dev \
+            libssl-dev libsqlite3-dev pkg-config \
+            linux-tools-common linux-tools-generic \
+            dpkg-dev
+
+      - name: Locate bpftool
+        run: |
+          sudo apt-get install -y linux-tools-$(uname -r) 2>/dev/null || true
+          BPFTOOL=""
+          for c in $(find /usr/lib/linux-tools -name bpftool 2>/dev/null | sort -t- -k1,1V); do
+            if "$c" version >/dev/null 2>&1; then BPFTOOL="$c"; fi
+          done
+          if [ -n "$BPFTOOL" ]; then sudo ln -sf "$BPFTOOL" /usr/local/bin/bpftool; fi
+
+      - name: Build argus binaries
+        run: make argus argus-server
+
+      - name: Build .deb
+        run: make deb
+
+      - name: Verify .deb metadata
+        run: |
+          deb=$(ls argus_*.deb)
+          echo "Package: $deb"
+          dpkg-deb --info "$deb"
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: argus-deb-${{ github.sha }}
+          path: "*.deb"
+          retention-days: 30

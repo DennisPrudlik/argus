@@ -37,9 +37,10 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 
-#define DEFAULT_PORT    9000
-#define MAX_CLIENTS     64
-#define LINE_BUF_SZ     4096
+#define DEFAULT_PORT     9000
+#define MAX_CLIENTS      64
+#define LINE_BUF_SZ      4096
+#define HB_TIMEOUT_S     300   /* close clients silent for this many seconds  */
 
 /* forward declaration — defined in globals section below */
 static FILE *g_out;
@@ -232,6 +233,8 @@ typedef struct {
     time_t   last_hb;      /* unix timestamp of last HEARTBEAT */
     char     version[32];  /* agent version from HEARTBEAT    */
     uint64_t agent_uptime; /* agent uptime_secs from HEARTBEAT */
+    char     agent_id[128];/* stable agent hostname/ID from HEARTBEAT; used
+                            * to detect reconnects from same sensor         */
 } client_t;
 
 /* ── globals ─────────────────────────────────────────────────────────────── */
@@ -325,6 +328,7 @@ static void accept_client(int listen_fd)
     c->connected_at = time(NULL);
     c->last_hb      = 0;
     c->version[0]   = '\0';
+    c->agent_id[0]  = '\0';
     c->agent_uptime = 0;
     g_nclients++;
     fprintf(stderr, "info: client connected from %s (fd=%d, total=%d)\n",
@@ -363,6 +367,8 @@ static void read_client(client_t *c)
             /* Heartbeat tracking — parse HEARTBEAT events to update agent state */
             if (strstr(start, "\"type\":\"HEARTBEAT\"")) {
                 c->last_hb = time(NULL);
+
+                /* Parse version string */
                 const char *vp = strstr(start, "\"version\":\"");
                 if (vp) {
                     vp += 11;
@@ -374,8 +380,40 @@ static void read_client(client_t *c)
                         c->version[vl] = '\0';
                     }
                 }
+
+                /* Parse uptime */
                 const char *up = strstr(start, "\"uptime_secs\":");
                 if (up) c->agent_uptime = (uint64_t)strtoull(up + 14, NULL, 10);
+
+                /* Parse agent_id (hostname) for reconnect deduplication */
+                const char *hp = strstr(start, "\"hostname\":\"");
+                if (hp) {
+                    hp += 12;
+                    const char *he = strchr(hp, '"');
+                    if (he) {
+                        size_t hl = (size_t)(he - hp);
+                        if (hl >= sizeof(c->agent_id)) hl = sizeof(c->agent_id) - 1;
+                        memcpy(c->agent_id, hp, hl);
+                        c->agent_id[hl] = '\0';
+
+                        /* Dedup: close any stale connection from the same agent.
+                         * This handles the case where a sensor crashes and
+                         * reconnects before the server detects the old TCP drop. */
+                        for (int j = 0; j < MAX_CLIENTS; j++) {
+                            client_t *o = &g_clients[j];
+                            if (o == c || o->fd < 0 || !o->agent_id[0]) continue;
+                            if (strcmp(o->agent_id, c->agent_id) == 0) {
+                                fprintf(stderr,
+                                    "info: evicting stale connection fd=%d ip=%s "
+                                    "(agent '%s' reconnected from %s)\n",
+                                    o->fd, o->remote_ip, c->agent_id, c->remote_ip);
+                                close(o->fd);
+                                o->fd = -1;
+                                g_nclients--;
+                            }
+                        }
+                    }
+                }
             }
 
             /* Fleet correlation */
@@ -422,13 +460,16 @@ static void usage(const char *prog)
         "  --mgmt-port           <N>     Management HTTP API port on 127.0.0.1 (0=off)\n"
         "                                  GET /agents — connected sensor health\n"
         "                                  GET /stats  — server statistics\n"
+        "  --hb-timeout          <secs>  Close agents silent for this long (default: %d)\n"
+        "                                  0 disables the timeout\n"
         "  --help                        Show this message\n",
-        prog, DEFAULT_PORT);
+        prog, DEFAULT_PORT, HB_TIMEOUT_S);
 }
 
 /* ── management HTTP server (/agents endpoint) ───────────────────────────── */
 
-static int g_mgmt_port = 0;
+static int g_mgmt_port   = 0;
+static int g_hb_timeout  = HB_TIMEOUT_S;   /* CLI-overridable */
 static time_t g_start_time = 0;
 
 static void *mgmt_server_thread(void *arg)
@@ -533,12 +574,13 @@ int main(int argc, char **argv)
         {"correlate-window",    required_argument, 0, 'w'},
         {"correlate-threshold", required_argument, 0, 'c'},
         {"mgmt-port",           required_argument, 0, 'm'},
+        {"hb-timeout",          required_argument, 0, 't'},
         {"help",                no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:o:s:w:c:m:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:o:s:w:c:m:t:h", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'p': port = atoi(optarg); break;
         case 'o': strncpy(output_path, optarg, sizeof(output_path) - 1); break;
@@ -546,6 +588,7 @@ int main(int argc, char **argv)
         case 'w': g_corr_window    = atoi(optarg); break;
         case 'c': g_corr_threshold = atoi(optarg); break;
         case 'm': g_mgmt_port      = atoi(optarg); break;
+        case 't': g_hb_timeout     = atoi(optarg); break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 1;
         }
@@ -630,10 +673,27 @@ int main(int argc, char **argv)
                 read_client(&g_clients[i]);
         }
 
-        /* Periodic stats */
-        if (stats_interval > 0) {
+        /* Periodic stats + stale-client sweep */
+        {
             time_t now = time(NULL);
-            if (now - last_stats >= stats_interval) {
+
+            /* Sweep for agents that stopped sending heartbeats */
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                client_t *sc = &g_clients[i];
+                if (sc->fd < 0) continue;
+                /* Only enforce timeout once we have received at least one hb */
+                if (sc->last_hb > 0 &&
+                    (now - sc->last_hb) > g_hb_timeout) {
+                    fprintf(stderr,
+                        "info: closing %s (fd=%d) — no heartbeat for %lds\n",
+                        sc->remote_ip, sc->fd, (long)(now - sc->last_hb));
+                    close(sc->fd);
+                    sc->fd = -1;
+                    g_nclients--;
+                }
+            }
+
+            if (stats_interval > 0 && now - last_stats >= stats_interval) {
                 last_stats = now;
                 fprintf(stderr, "stats: clients=%d total_lines=%llu\n",
                         g_nclients, (unsigned long long)g_total_lines);
