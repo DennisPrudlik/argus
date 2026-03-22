@@ -228,9 +228,15 @@ deb: argus argus-server
 	mkdir -p pkg/deb$(LOGROTATEDIR)
 	install -m755 argus            pkg/deb$(BINDIR)/argus
 	install -m755 argus-server     pkg/deb$(BINDIR)/argus-server
-	install -m644 packaging/argus.service    pkg/deb$(UNITDIR)/argus.service
-	install -m644 packaging/argus.tmpfiles   pkg/deb$(TMPFILESDIR)/argus.conf
-	install -m644 packaging/argus.logrotate  pkg/deb$(LOGROTATEDIR)/argus
+	install -m644 packaging/argus.service         pkg/deb$(UNITDIR)/argus.service
+	install -m644 packaging/argus-server.service  pkg/deb$(UNITDIR)/argus-server.service
+	install -m644 packaging/argus.tmpfiles        pkg/deb$(TMPFILESDIR)/argus.conf
+	install -m644 packaging/argus.logrotate       pkg/deb$(LOGROTATEDIR)/argus
+	mkdir -p pkg/deb/etc/bash_completion.d pkg/deb/usr/share/zsh/site-functions \
+	         pkg/deb/usr/share/doc/argus
+	install -m644 packaging/argus-completion.bash pkg/deb/etc/bash_completion.d/argus
+	install -m644 packaging/argus-completion.zsh  pkg/deb/usr/share/zsh/site-functions/_argus
+	install -m644 packaging/argus.conf.example    pkg/deb/usr/share/doc/argus/argus.conf.example
 	printf 'Package: argus\nVersion: $(VERSION)\nSection: security\nPriority: optional\nArchitecture: $(ARCH_PKG)\nDepends: libbpf0\nMaintainer: argus project\nDescription: eBPF-based syscall telemetry daemon\n argus monitors process execution, file access, network connections\n and security-relevant syscalls via eBPF tracepoints.\n' \
 	    > pkg/deb/DEBIAN/control
 	install -m755 packaging/debian/postinst pkg/deb/DEBIAN/postinst
@@ -252,19 +258,29 @@ rpm: argus packaging/argus.spec
 man: man/argus.8
 	gzip -k man/argus.8 -c > man/argus.8.gz
 
+BASHCOMPDIR  = $(DESTDIR)/etc/bash_completion.d
+ZSHCOMPDIR   = $(DESTDIR)/usr/share/zsh/site-functions
+EXAMPLEDIR   = $(DESTDIR)/usr/share/doc/argus
+
 install: argus argus-server
-	install -Dm755 argus                        $(BINDIR)/argus
-	install -Dm755 argus-server                 $(BINDIR)/argus-server
-	install -Dm644 packaging/argus.service      $(UNITDIR)/argus.service
-	install -Dm644 packaging/argus.tmpfiles     $(TMPFILESDIR)/argus.conf
-	install -Dm644 packaging/argus.logrotate    $(LOGROTATEDIR)/argus
-	install -Dm644 man/argus.8                  $(MANDIR)/argus.8
+	install -Dm755 argus                              $(BINDIR)/argus
+	install -Dm755 argus-server                       $(BINDIR)/argus-server
+	install -Dm644 packaging/argus.service            $(UNITDIR)/argus.service
+	install -Dm644 packaging/argus-server.service     $(UNITDIR)/argus-server.service
+	install -Dm644 packaging/argus.tmpfiles           $(TMPFILESDIR)/argus.conf
+	install -Dm644 packaging/argus.logrotate          $(LOGROTATEDIR)/argus
+	install -Dm644 man/argus.8                        $(MANDIR)/argus.8
+	install -Dm644 packaging/argus-completion.bash    $(BASHCOMPDIR)/argus
+	install -Dm644 packaging/argus-completion.zsh     $(ZSHCOMPDIR)/_argus
+	install -Dm644 packaging/argus.conf.example       $(EXAMPLEDIR)/argus.conf.example
 	@echo "Run: systemd-tmpfiles --create && systemctl daemon-reload && systemctl enable --now argus"
 
 uninstall:
 	rm -f $(BINDIR)/argus $(BINDIR)/argus-server \
-	      $(UNITDIR)/argus.service \
-	      $(TMPFILESDIR)/argus.conf $(LOGROTATEDIR)/argus $(MANDIR)/argus.8
+	      $(UNITDIR)/argus.service $(UNITDIR)/argus-server.service \
+	      $(TMPFILESDIR)/argus.conf $(LOGROTATEDIR)/argus $(MANDIR)/argus.8 \
+	      $(BASHCOMPDIR)/argus $(ZSHCOMPDIR)/_argus \
+	      $(EXAMPLEDIR)/argus.conf.example
 
 clean:
 	rm -f argus argus-server argus-bench \

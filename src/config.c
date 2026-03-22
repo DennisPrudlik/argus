@@ -393,6 +393,10 @@ int cfg_load(const char *path, argus_cfg_t *cfg)
         else if (strcmp(key, "mem_forensics") == 0) {
             int v = 0; p = parse_bool(p, &v); cfg->mem_forensics = v;
         }
+        else if (key[0] != '\0') {
+            /* Unknown key — warn so users catch typos in config files */
+            fprintf(stderr, "argus: config: unknown key \"%s\" (ignored)\n", key);
+        }
 
         /* advance past current value to next key */
         while (*p && *p != ',' && *p != '}') p++;
