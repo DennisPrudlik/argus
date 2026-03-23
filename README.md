@@ -8,6 +8,10 @@ A lightweight Linux kernel telemetry and threat-detection tool built on eBPF. Tr
 
 **Version 0.2.0** — Added 12 new kernel-traced event types, active response (BPF kill), threat-intel CIDR feed, file integrity monitoring, LD_PRELOAD detection, DGA/entropy detection, DNS→IP correlation, per-PID rate limiting, Prometheus metrics, cgroup-aware baselines, rolling baseline merge, alert suppression, process-ancestry rule matching, and fleet aggregation server.
 
+## Motivation
+
+Existing open-source host-based intrusion detection tools either operate entirely in userspace (high overhead, easily bypassed) or require kernel modules that break on every kernel update. Argus uses eBPF — a safe, verifier-checked in-kernel VM — to trace all 21 security-relevant event types with sub-microsecond latency and no kernel patching. Every event carries full process ancestry and container attribution out of the box, closing the gap between raw syscall visibility and actionable fleet-wide threat detection.
+
 ## Requirements
 
 - Linux kernel **5.8+** with BTF enabled (`/sys/kernel/btf/vmlinux` must exist)
@@ -91,6 +95,30 @@ cat /var/log/argus/events.jsonl       # persistent JSONL output
 ```
 
 The service writes JSON to `/var/log/argus/events.jsonl`, drops privileges to `nobody` after attach, and restarts automatically on failure. Log rotation is configured via the installed `logrotate` config (daily, 14 days, compressed).
+
+## Quick Start
+
+```sh
+# 1. Install build dependencies (Ubuntu/Debian)
+sudo apt-get install -y clang llvm libbpf-dev libelf-dev zlib1g-dev \
+     linux-tools-common linux-tools-generic libssl-dev python3
+
+# 2. Clone and build
+git clone https://github.com/DennisPrudlik/argus
+cd argus
+make
+
+# 3. Run (requires root or CAP_BPF + CAP_PERFMON)
+sudo ./argus
+
+# 4. Stream JSON to a file
+sudo ./argus --fmt json > /tmp/events.jsonl
+
+# 5. Watch only network connections from a specific process
+sudo ./argus --comm curl --event-mask CONNECT
+```
+
+See [Install](#install) for package-based deployment and systemd service setup.
 
 ## Usage
 
@@ -1287,3 +1315,16 @@ lima/                    Lima VM config for development on non-Linux hosts
 Makefile                 Build entry point (targets: all, test, test-asan, test-integration,
                            install, deb, rpm, man, clean)
 ```
+
+## Contributing
+
+Contributions are welcome. Please follow these steps:
+
+1. **Fork** the repository and create a branch from `main`.
+2. **Build and test** before submitting: `make && make test && make test-asan`
+3. **BPF changes** — run `make test-integration` on a Linux host (kernel 5.8+ with BTF). The dev container (`.devcontainer/`) and Lima config (`lima/`) both provide a ready environment.
+4. **Style** — userspace C follows `-Wall -Wextra -Wno-unused-parameter -std=c11` with zero warnings. BPF C follows the same flags plus `-target bpf`.
+5. **Tests** — new modules need a corresponding `tests/test_<module>.c` with `make test-unit` coverage. Extend `tests/test_enterprise.c` for enterprise-tier features.
+6. **Open a pull request** with a clear description of what changed and why. Reference any related issue numbers.
+
+For bug reports and feature requests, open a GitHub issue with the relevant kernel version, distro, and `argus --version` output.
